@@ -13,6 +13,9 @@
   uv,
   OVMF,
   qemu_kvm,
+  fontconfig,
+  dejavu_fonts,
+  liberation_ttf,
 }:
 
 let
@@ -80,7 +83,10 @@ buildFHSEnv {
     claude-desktop
     docker
     docker-compose
+    fontconfig
+    dejavu_fonts
     glibc
+    liberation_ttf
     nodejs
     openssl
     ovmfCompat
