@@ -64,6 +64,18 @@ let
           ];
     in
     runCommand "claude-desktop-ovmf-compat" { } (lib.concatStrings pairs);
+
+  # The cowork-linux-helper only probes /usr/bin/virtiofsd and
+  # /usr/libexec/virtiofsd for the virtiofs daemon. The .deb installs
+  # it at lib/claude-desktop/resources/virtiofsd (-> /usr/lib64/... in
+  # the FHS), which is never found. Without it the helper reports
+  # virtualization_tools_missing -> yukonSilver=unsupported -> dispatch
+  # bash permanently fails.
+  # Ref: https://github.com/anthropics/claude-code/issues/74605
+  virtiofsdLink = runCommand "virtiofsd-link" { } ''
+    mkdir -p $out/bin
+    ln -s ${claude-desktop}/lib/claude-desktop/resources/virtiofsd $out/bin/virtiofsd
+  '';
 in
 buildFHSEnv {
   name = "claude-desktop";
@@ -92,6 +104,7 @@ buildFHSEnv {
     ovmfCompat
     qemu_kvm
     uv
+    virtiofsdLink
   ];
 
   runScript = "${claude-desktop}/bin/claude-desktop";
