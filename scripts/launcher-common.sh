@@ -2,8 +2,11 @@
 # Common launcher functions for Claude Desktop (AppImage and deb)
 # This file is sourced by both launchers to avoid code duplication
 
-# WM_CLASS / StartupWMClass — must match upstream productName.
-# @@WM_CLASS@@ is replaced at build time; see build.sh.
+# WM_CLASS / StartupWMClass — must match the runtime window class,
+# which Chromium derives from the asar package.json desktopName (not
+# productName, not --class, not the ELF basename). @@WM_CLASS@@ is
+# replaced at package time with the value patch_app_asar derives from
+# the staged app.asar; see scripts/patches/app-asar.sh (#779).
 readonly WM_CLASS='@@WM_CLASS@@'
 
 # Rotate launcher.log when it exceeds a size cap, keeping a couple of
@@ -90,7 +93,8 @@ log_session_env() {
 		CLAUDE_USE_WAYLAND \
 		CLAUDE_PASSWORD_STORE \
 		CLAUDE_GTK_IM_MODULE \
-		CLAUDE_DISABLE_GPU
+		CLAUDE_DISABLE_GPU \
+		CLAUDE_TRAY_USE_DARK_ICON
 	do
 		log_message "  $key=${!key:-}"
 	done
@@ -239,7 +243,7 @@ _previous_launch_hit_gpu_fatal() {
 # Linux-environment gap; the tools/chromium-switch-smoke.sh guard
 # fails loudly if the effective switch list drifts without a
 # deliberate baseline update. Kept defaults, each with its reason:
-#   --class=$WM_CLASS         WM_CLASS/.desktop contract (#647, #652)
+#   --class=$WM_CLASS         cmdline UI fingerprint (#647, #652, #779)
 #   XRDP auto GPU-off         blank window on remote GPU (#319)
 #   GPU-crash sticky recovery GPU process FATAL exhaustion (#583)
 #   Wayland backend selection CLAUDE_USE_WAYLAND tri-state (#226, #404)
@@ -266,8 +270,11 @@ build_electron_args() {
 	# AppImage always needs --no-sandbox due to FUSE constraints
 	[[ $package_type == 'appimage' ]] && electron_args+=('--no-sandbox')
 
-	# WM_CLASS must match the .desktop StartupWMClass and upstream's
-	# productName. Ref: #647, #652
+	# Chromium ignores --class for the window class (it reads the asar
+	# desktopName instead — WM_CLASS is derived from the same field),
+	# but the flag is load-bearing as the /proc cmdline UI fingerprint:
+	# _claude_desktop_ui_cmdline_matches keys on it. Ref: #647, #652,
+	# #779
 	electron_args+=("--class=$WM_CLASS")
 
 	# Password store: the official build's os_crypt autodetection owns
@@ -817,6 +824,7 @@ load_launcher_config() {
 	# space-delimited match for the key that follows it.
 	local allowlist=' CLAUDE_USE_WAYLAND CLAUDE_PASSWORD_STORE'
 	allowlist+=' CLAUDE_GTK_IM_MODULE CLAUDE_DISABLE_GPU'
+	allowlist+=' CLAUDE_TRAY_USE_DARK_ICON'
 	allowlist+=' COWORK_VM_BACKEND COWORK_NODE_PATH '
 	local line key val
 	while IFS= read -r line || [[ -n $line ]]; do
@@ -847,6 +855,43 @@ load_launcher_config() {
 	done < "$cfg"
 }
 
+# Cinnamon can use a dark panel (org.cinnamon.theme) while GTK's colour
+# scheme stays light, so Electron's shouldUseDarkColors picks the black
+# tray PNG on a dark gray panel (#604). Export CLAUDE_TRAY_USE_DARK_ICON
+# for the asar patch; set it yourself to 0/1 to override auto-detect.
+setup_tray_icon_env() {
+	if [[ -n ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]; then
+		export CLAUDE_TRAY_USE_DARK_ICON
+		log_message \
+			"Tray icon: CLAUDE_TRAY_USE_DARK_ICON=$CLAUDE_TRAY_USE_DARK_ICON (preset)"
+		if [[ $CLAUDE_TRAY_USE_DARK_ICON != 0 \
+			&& $CLAUDE_TRAY_USE_DARK_ICON != 1 ]]; then
+			log_message \
+				'Tray icon: preset is not 0/1 — the app ignores it,' \
+				'and Cinnamon auto-detect stays off'
+		fi
+		return 0
+	fi
+
+	local desktop="${XDG_CURRENT_DESKTOP:-}"
+	[[ ${desktop,,} == *cinnamon* ]] || return 0
+
+	if ! command -v gsettings &>/dev/null; then
+		return 0
+	fi
+
+	local cinnamon_theme
+	cinnamon_theme=$(gsettings get org.cinnamon.theme name 2>/dev/null) \
+		|| return 0
+	cinnamon_theme=${cinnamon_theme//[\'\"]/}
+	[[ ${cinnamon_theme,,} == *dark* ]] || return 0
+
+	export CLAUDE_TRAY_USE_DARK_ICON=1
+	log_message \
+		"Tray icon: cinnamon theme '$cinnamon_theme' has a dark panel;" \
+		'using TrayIconLinux-Dark.png (CLAUDE_TRAY_USE_DARK_ICON=1)'
+}
+
 setup_electron_env() {
 	# Persistent per-user launcher env (GUI launches can't set env via
 	# the .desktop Exec line) — load before anything reads these vars.
@@ -868,6 +913,7 @@ setup_electron_env() {
 			"GTK_IM_MODULE override: $prev -> $GTK_IM_MODULE (via CLAUDE_GTK_IM_MODULE)"
 	fi
 
+	setup_tray_icon_env
 	setup_cowork_bwrap_env
 }
 

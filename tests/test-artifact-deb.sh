@@ -152,7 +152,7 @@ assert_contains '/usr/bin/claude-desktop-unofficial' 'build_electron_args' \
 
 # --- App contents (asar) ---
 resources_dir='/usr/lib/claude-desktop-unofficial/resources'
-validate_app_contents "$resources_dir"
+validate_app_contents "$resources_dir" "$desktop_file"
 
 # app.asar.unpacked must be world-traversable and root-owned, or
 # Cowork's auto-launch fs.existsSync() guard silently fails (#695).
@@ -174,6 +174,13 @@ if [[ $doctor_exit -lt 127 ]]; then
 else
 	fail "--doctor crashed (exit: $doctor_exit)"
 fi
+
+# --- Launcher --version fast-path (#775) ---
+# The control Version is the exact string deb.sh baked into the
+# launcher's echo, so this asserts the full line.
+run_version_flag_test 'deb launcher' \
+	"claude-desktop-unofficial $(dpkg-deb -f "$deb_file" Version)" \
+	/usr/bin/claude-desktop-unofficial
 
 # --- Headless launch smoke test ---
 # ubuntu-latest runs as a non-root user, so no privilege drop needed.

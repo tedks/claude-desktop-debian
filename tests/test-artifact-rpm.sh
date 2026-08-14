@@ -145,7 +145,7 @@ fi
 
 # --- App contents (asar) ---
 resources_dir='/usr/lib/claude-desktop-unofficial/resources'
-validate_app_contents "$resources_dir"
+validate_app_contents "$resources_dir" "$desktop_file"
 
 # app.asar.unpacked must be world-traversable and root-owned, or
 # Cowork's auto-launch fs.existsSync() guard silently fails (#695).
@@ -165,6 +165,16 @@ if [[ $doctor_exit -lt 127 ]]; then
 else
 	fail "--doctor crashed (exit: $doctor_exit)"
 fi
+
+# --- Launcher --version fast-path (#775) ---
+# The launcher bakes the RAW (possibly hyphenated) build version, while
+# rpm splits it into %{VERSION}-%{RELEASE} — so match on the %{VERSION}
+# prefix, which is common to both forms. Runs fine as root: the
+# fast-path exits before any Electron/sandbox logic.
+run_version_flag_test 'rpm launcher' \
+	"claude-desktop-unofficial $(rpm -qp --queryformat '%{VERSION}' \
+		"$rpm_file" 2>/dev/null)" \
+	/usr/bin/claude-desktop-unofficial
 
 # --- Headless launch smoke test ---
 # The container runs as root; Electron aborts as root without
