@@ -65,7 +65,6 @@ let
           ];
     in
     runCommand "claude-desktop-ovmf-compat" { } (lib.concatStrings pairs);
-
 in
 buildFHSEnv {
   name = "claude-desktop";
