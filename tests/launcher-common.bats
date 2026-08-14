@@ -56,12 +56,13 @@ setup() {
 	unset QT_IM_MODULE
 	unset CLAUDE_GTK_IM_MODULE
 	unset CLAUDE_PASSWORD_STORE
+	unset CLAUDE_TRAY_USE_DARK_ICON
 
 	# Copy to temp dir so we can substitute the build-time placeholder
 	# and co-locate doctor.sh (sourced via BASH_SOURCE dirname).
 	cp "$SCRIPT_DIR/../scripts/launcher-common.sh" "$TEST_TMP/launcher-common.sh"
 	cp "$SCRIPT_DIR/../scripts/doctor.sh" "$TEST_TMP/doctor.sh"
-	sed -i 's/@@WM_CLASS@@/Claude/' "$TEST_TMP/launcher-common.sh"
+	sed -i 's/@@WM_CLASS@@/com.anthropic.Claude/' "$TEST_TMP/launcher-common.sh"
 	# shellcheck source=scripts/launcher-common.sh
 	source "$TEST_TMP/launcher-common.sh"
 }
@@ -175,21 +176,21 @@ teardown() {
 	setup_logging
 	# Both the "Arguments:" and "Executing:" lines carry $* verbatim.
 	log_message "Arguments: claude://login/google-auth?code=SECRET123&state=xyz"
-	log_message "Executing: /usr/lib/claude-desktop/claude-desktop --class=Claude claude://login/google-auth?code=SECRET456"
+	log_message "Executing: /usr/lib/claude-desktop/claude-desktop --class=com.anthropic.Claude claude://login/google-auth?code=SECRET456"
 	run cat "$log_file"
 	[[ "$output" != *SECRET123* ]]
 	[[ "$output" != *SECRET456* ]]
 	[[ "$output" != *'code='* ]]
 	# Path is kept for context; only the query string is stripped.
 	[[ "${lines[0]}" == 'Arguments: claude://login/google-auth?<redacted>' ]]
-	[[ "${lines[1]}" == *'--class=Claude claude://login/google-auth?<redacted>' ]]
+	[[ "${lines[1]}" == *'--class=com.anthropic.Claude claude://login/google-auth?<redacted>' ]]
 }
 
 @test "log_message: leaves non-login messages untouched" {
 	setup_logging
-	log_message 'Executing: /usr/lib/claude-desktop/claude-desktop --class=Claude'
+	log_message 'Executing: /usr/lib/claude-desktop/claude-desktop --class=com.anthropic.Claude'
 	run cat "$log_file"
-	[[ "${lines[0]}" == 'Executing: /usr/lib/claude-desktop/claude-desktop --class=Claude' ]]
+	[[ "${lines[0]}" == 'Executing: /usr/lib/claude-desktop/claude-desktop --class=com.anthropic.Claude' ]]
 }
 
 # =============================================================================
@@ -209,6 +210,7 @@ teardown() {
 	CLAUDE_PASSWORD_STORE='basic'
 	CLAUDE_GTK_IM_MODULE='xim'
 	CLAUDE_DISABLE_GPU='1'
+	CLAUDE_TRAY_USE_DARK_ICON='1'
 	log_session_env
 
 	run cat "$log_file"
@@ -228,7 +230,8 @@ teardown() {
 	[[ "${lines[9]}"  == '  CLAUDE_PASSWORD_STORE=basic' ]]
 	[[ "${lines[10]}" == '  CLAUDE_GTK_IM_MODULE=xim' ]]
 	[[ "${lines[11]}" == '  CLAUDE_DISABLE_GPU=1' ]]
-	[[ "${lines[12]}" == '}' ]]
+	[[ "${lines[12]}" == '  CLAUDE_TRAY_USE_DARK_ICON=1' ]]
+	[[ "${lines[13]}" == '}' ]]
 }
 
 @test "log_session_env: unset/empty values render as 'KEY=' (no value)" {
@@ -429,7 +432,7 @@ teardown() {
 	is_wayland=false
 	setup_logging
 	build_electron_args deb
-	has_electron_arg '--class=Claude'
+	has_electron_arg '--class=com.anthropic.Claude'
 }
 
 @test "build_electron_args: X11 deb defaults to a minimal argv (opt-in policy)" {
@@ -442,7 +445,7 @@ teardown() {
 	setup_logging
 	build_electron_args deb
 	[[ ${#electron_args[@]} -eq 1 ]]
-	[[ ${electron_args[0]} == '--class=Claude' ]]
+	[[ ${electron_args[0]} == '--class=com.anthropic.Claude' ]]
 }
 
 @test "build_electron_args: CLAUDE_PASSWORD_STORE set - passes flag + logs it" {
@@ -714,8 +717,30 @@ s.close()
 	# stand-in's argv[0] is renamed to carry it via exec -a. Its state
 	# is sleeping (not T/t/Z), so the function treats it as a live UI
 	# and must NOT kill the daemon.
-	bash -c 'exec -a "--class=Claude" sleep 300' &
+	bash -c 'exec -a "--class=com.anthropic.Claude" sleep 300' &
 	ui_pid=$!
+	# Wait for the exec to land before running the reaper: on a loaded
+	# runner the child can still carry its pre-exec argv when the UI
+	# scan reads /proc cmdline, so the fingerprint misses and the
+	# reaper takes the orphan path (flaked CI on 2026-07-10). Poll the
+	# reaper's own predicate, not a parallel pattern that can drift —
+	# a loose grep matches the pre-exec cmdline (--class=Claude inside
+	# the bash -c quoting) that the strict fingerprint still rejects.
+	# Fail loudly on timeout: exec lands in ~4ms, so a silent
+	# fall-through would reproduce the exact flake signature this
+	# poll exists to kill. Plain assignment, not ((i++)), to dodge
+	# the errexit trap.
+	local _i=0
+	while ! _claude_desktop_ui_cmdline_matches \
+		"$(tr '\0' ' ' < "/proc/$ui_pid/cmdline" 2>/dev/null)"; do
+		if ((_i >= 50)); then
+			echo "stand-in UI $ui_pid never matched the reaper's" \
+				'fingerprint within 5s' >&2
+			return 1
+		fi
+		sleep 0.1
+		_i=$((_i + 1))
+	done
 
 	# Match on "$*", not "$2": the UI scan passes -u <uid> and a `--`
 	# end-of-options separator before the pattern, so the pattern is
@@ -723,7 +748,7 @@ s.close()
 	pgrep() {
 		if [[ $* == *cowork-vm-service* ]]; then
 			echo 4242
-		elif [[ $* == *--class=Claude* ]]; then
+		elif [[ $* == *--class=com.anthropic.Claude* ]]; then
 			echo "$ui_pid"
 		fi
 	}
@@ -861,7 +886,7 @@ s.close()
 	# longer appears in any cmdline, so the --class flag from
 	# build_electron_args is the only stable UI signature.
 	run _claude_desktop_ui_cmdline_matches \
-		"/usr/lib/claude-desktop/claude-desktop --class=Claude --enable-features=WaylandWindowDecorations "
+		"/usr/lib/claude-desktop/claude-desktop --class=com.anthropic.Claude --enable-features=WaylandWindowDecorations "
 	[[ $status -eq 0 ]]
 
 	# Another Electron app's asar path must not match.
@@ -871,18 +896,18 @@ s.close()
 
 	# Look-alike WM class is rejected by the trailing-space anchor.
 	run _claude_desktop_ui_cmdline_matches \
-		"/opt/claude-dev/electron --class=ClaudeDev "
+		"/opt/claude-dev/electron --class=com.anthropic.ClaudeDev "
 	[[ $status -ne 0 ]]
 
 	# Chromium helpers (--type=) never count as the UI, even if a
 	# --class flag leaked into their argv.
 	run _claude_desktop_ui_cmdline_matches \
-		"/usr/lib/claude-desktop/claude-desktop --type=utility --user-data-dir=$XDG_CONFIG_HOME/Claude --class=Claude "
+		"/usr/lib/claude-desktop/claude-desktop --type=utility --user-data-dir=$XDG_CONFIG_HOME/Claude --class=com.anthropic.Claude "
 	[[ $status -ne 0 ]]
 
 	# The cowork daemon never counts as the UI.
 	run _claude_desktop_ui_cmdline_matches \
-		"/usr/lib/claude-desktop/resources/app.asar.unpacked/cowork-vm-service.js --class=Claude "
+		"/usr/lib/claude-desktop/resources/app.asar.unpacked/cowork-vm-service.js --class=com.anthropic.Claude "
 	[[ $status -ne 0 ]]
 }
 
@@ -1227,4 +1252,155 @@ _write_launcher_cfg() {
 	run run_doctor ''
 	[[ $output == *'COWORK_VM_BACKEND=bwrap'* ]]
 	[[ $output == *'bwrap daemon runtime'* ]]
+}
+
+# =============================================================================
+# setup_cowork_bwrap_env: resolve the bwrap daemon's node runtime (#772)
+# =============================================================================
+
+# The launcher resolves a system node for the bwrap fallback daemon
+# (the official Electron ships with the RunAsNode fuse off) and exports
+# COWORK_NODE_PATH for the patched spawn. Only the flagged path may
+# touch the environment.
+
+# Write an executable node stub at $1 that fails the statfsSync
+# capability probe (any invocation exits 1, so --version fails too —
+# matching a runtime too old to matter).
+_stub_featureless_node() {
+	printf '#!/bin/sh\nexit 1\n' > "$1"
+	chmod +x "$1"
+}
+
+@test "setup_cowork_bwrap_env: no-op when the backend flag is not bwrap" {
+	unset COWORK_VM_BACKEND COWORK_NODE_PATH
+	setup_cowork_bwrap_env
+	[[ -z ${COWORK_NODE_PATH:-} ]]
+}
+
+@test "setup_cowork_bwrap_env: explicit COWORK_NODE_PATH is honored" {
+	command -v node >/dev/null || skip 'node not installed'
+	# A symlinked copy in TEST_TMP is distinguishable from what the
+	# PATH probe would resolve, so this proves precedence (the
+	# explicit path survives the call), not just the log line.
+	ln -s "$(command -v node)" "$TEST_TMP/pinned-node"
+	export COWORK_VM_BACKEND=bwrap
+	export COWORK_NODE_PATH="$TEST_TMP/pinned-node"
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_cowork_bwrap_env
+	[[ $COWORK_NODE_PATH == "$TEST_TMP/pinned-node" ]]
+	grep -qF "daemon node: $TEST_TMP/pinned-node" "$log_file"
+}
+
+@test "setup_cowork_bwrap_env: auto-detects node from PATH and exports it" {
+	command -v node >/dev/null || skip 'node not installed'
+	export COWORK_VM_BACKEND=bwrap
+	unset COWORK_NODE_PATH
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_cowork_bwrap_env
+	[[ ${COWORK_NODE_PATH:-} == "$(command -v node)" ]]
+}
+
+@test "setup_cowork_bwrap_env: no node anywhere logs cannot-start, exports nothing" {
+	# Shadow `command` so -v node/nodejs both miss (the _skip_gtk_query
+	# pattern) — emptying PATH would break log_message's own tooling.
+	command() {
+		if [[ $1 == '-v' && ( $2 == 'node' || $2 == 'nodejs' ) ]]; then
+			return 1
+		fi
+		builtin command "$@"
+	}
+	export COWORK_VM_BACKEND=bwrap
+	unset COWORK_NODE_PATH
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_cowork_bwrap_env
+	[[ -z ${COWORK_NODE_PATH:-} ]]
+	grep -q 'cannot start' "$log_file"
+}
+
+@test "setup_cowork_bwrap_env: statfsSync-less node logs the capability warning" {
+	_stub_featureless_node "$TEST_TMP/oldnode"
+	export COWORK_VM_BACKEND=bwrap
+	export COWORK_NODE_PATH="$TEST_TMP/oldnode"
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_cowork_bwrap_env
+	grep -q 'lacks fs.statfsSync' "$log_file"
+	grep -q 'refuse to start' "$log_file"
+}
+
+# =============================================================================
+# setup_tray_icon_env: Cinnamon dark-panel tray PNG selection (#604)
+# =============================================================================
+
+@test "setup_tray_icon_env: preset value is exported unchanged" {
+	export CLAUDE_TRAY_USE_DARK_ICON=0
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_tray_icon_env
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == 0 ]]
+	grep -q 'CLAUDE_TRAY_USE_DARK_ICON=0 (preset)' "$log_file"
+	# A valid preset must not draw the not-0/1 note
+	run grep -q 'not 0/1' "$log_file"
+	[[ $status -ne 0 ]]
+}
+
+@test "setup_tray_icon_env: non-0/1 preset logs that the app ignores it" {
+	export CLAUDE_TRAY_USE_DARK_ICON=true
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_tray_icon_env
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == true ]]
+	grep -q 'CLAUDE_TRAY_USE_DARK_ICON=true (preset)' "$log_file"
+	grep -q 'not 0/1' "$log_file"
+}
+
+@test "setup_tray_icon_env: cinnamon dark theme sets CLAUDE_TRAY_USE_DARK_ICON=1" {
+	unset CLAUDE_TRAY_USE_DARK_ICON
+	export XDG_CURRENT_DESKTOP=X-Cinnamon
+	mkdir -p "$TEST_TMP/bin"
+	# bash shebang, not sh: the stub body uses [[ ]], and CI's /bin/sh
+	# is dash — under sh the stub exits 127 and the test lies
+	cat > "$TEST_TMP/bin/gsettings" << 'EOF'
+#!/usr/bin/env bash
+if [[ $1 == get && $3 == name ]]; then
+	printf "'Mint-Y-Dark-Aqua'\n"
+fi
+EOF
+	chmod +x "$TEST_TMP/bin/gsettings"
+	PATH="$TEST_TMP/bin:$PATH"
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	setup_tray_icon_env
+	[[ $CLAUDE_TRAY_USE_DARK_ICON == 1 ]]
+	grep -q 'TrayIconLinux-Dark.png' "$log_file"
+}
+
+@test "setup_tray_icon_env: cinnamon light theme leaves env unset" {
+	unset CLAUDE_TRAY_USE_DARK_ICON
+	export XDG_CURRENT_DESKTOP=X-Cinnamon
+	mkdir -p "$TEST_TMP/bin"
+	# The stub records that it ran: a broken stub returning early is
+	# otherwise indistinguishable from the theme check working
+	cat > "$TEST_TMP/bin/gsettings" << EOF
+#!/usr/bin/env bash
+touch "$TEST_TMP/gsettings-called"
+if [[ \$1 == get && \$3 == name ]]; then
+	printf "'Mint-Y'\n"
+fi
+EOF
+	chmod +x "$TEST_TMP/bin/gsettings"
+	PATH="$TEST_TMP/bin:$PATH"
+	setup_tray_icon_env
+	[[ -e $TEST_TMP/gsettings-called ]]
+	[[ -z ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]
+}
+
+@test "setup_tray_icon_env: non-cinnamon desktop is a no-op" {
+	unset CLAUDE_TRAY_USE_DARK_ICON
+	export XDG_CURRENT_DESKTOP=KDE
+	setup_tray_icon_env
+	[[ -z ${CLAUDE_TRAY_USE_DARK_ICON:-} ]]
 }

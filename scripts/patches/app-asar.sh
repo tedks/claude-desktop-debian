@@ -8,13 +8,14 @@
 #
 # Each entry is a function sourced from scripts/patches/*.sh that edits
 # the main-process JS relative to CWD; patch_app_asar runs them with
-# CWD = $app_staging_dir/resources and sets $main_js (resolved by
-# _resolve_main_js — see below) as the file every patch operates on.
+# CWD = $app_staging_dir/resources. Each patch resolves the file its own
+# anchor lives in via _resolve_anchor_file — there is no single
+# main-process file to hand them all (see that function's comment).
 #
 # Sourced by: build.sh
 # Sourced globals:
-#   app_staging_dir, asar_exec, work_dir, project_root, WM_CLASS
-# Modifies globals: main_js
+#   app_staging_dir, asar_exec, work_dir, project_root
+# Modifies globals: WM_CLASS (derived + exported)
 #===============================================================================
 
 # Survivor candidates per docs/learnings/official-deb-rebase-verification.md:
@@ -34,11 +35,22 @@
 #                              #772). Every branch is gated on
 #                              COWORK_VM_BACKEND=bwrap, so unflagged
 #                              launches ship the official path unchanged.
+#   patch_tray_icon_env_override — Cinnamon can use a dark panel while
+#                              GTK still reports a light colour scheme,
+#                              so upstream's shouldUseDarkColors
+#                              heuristic picks the wrong PNG (#604).
+#                              The launcher exports
+#                              CLAUDE_TRAY_USE_DARK_ICON; this threads
+#                              it into the existing ternary. Interim
+#                              pending upstream (anthropics/claude-code
+#                              #77170); its hard-fail anchor is the
+#                              retirement tripwire.
 active_patches=(
 	patch_quick_window
 	patch_org_plugins_path
 	patch_virtiofsd_probe
 	patch_cowork_bwrap
+	patch_tray_icon_env_override
 )
 
 # The #768 config-wipe guard (config.sh) is NOT wired: a contrarian
@@ -110,49 +122,90 @@ _asar_package_json_field() {
 		"$meta_dir/package.json" "$field"
 }
 
-# Resolve the main-process JS file inside the extracted asar and echo
-# its path relative to the resources CWD. Pre-3.x bundles kept the whole
-# main process in .vite/build/index.js. Since upstream 1.19367.0 the
-# bundle is code-split: index.js is a ~700-byte stub that require()s the
-# real main chunk (index.chunk-<hash>.js — content-hashed, so the name
-# changes every release). Follow the stub's require to the chunk; fall
-# back to index.js for the pre-split layout. All active patches anchor on
-# literals that live in this one chunk; if a future release spreads them
-# across chunks, the patches need per-anchor resolution (this returns
-# non-zero on a multi-chunk split rather than mispatching silently).
-_resolve_main_js() {
-	local build_dir='app.asar.contents/.vite/build'
-	local stub="$build_dir/index.js"
+# Derive the WM_CLASS / StartupWMClass value from the asar's
+# package.json desktopName (#779). Chromium derives the runtime X11
+# WM_CLASS / Wayland app_id from that field minus its .desktop suffix
+# — not from the ELF basename, the launcher's --class flag, or
+# productName. Upstream has renamed it once already
+# (claude-desktop.desktop → com.anthropic.Claude.desktop across
+# 1.18286.0 → 1.19367.0), so any hardcoded value silently breaks
+# window-to-launcher grouping on the next rename. Verified live on
+# GNOME and KDE against both releases (see #786).
+_derive_wm_class() {
+	local desktop_name="$1"
 
-	if [[ ! -f $stub ]]; then
-		echo "No index.js under $build_dir — upstream layout changed?" >&2
+	if [[ -z $desktop_name ]]; then
+		echo 'Error: package.json desktopName is missing/empty — cannot' \
+			'derive WM_CLASS. Upstream moved the field Chromium reads' \
+			'the window class from; re-verify before shipping (#779).' >&2
+		return 1
+	fi
+	if [[ $desktop_name != *.desktop ]]; then
+		echo "Error: desktopName '$desktop_name' has no .desktop" \
+			'suffix — upstream changed its shape; re-verify how Chromium' \
+			'derives the window class before shipping (#779).' >&2
+		return 1
+	fi
+	printf '%s\n' "${desktop_name%.desktop}"
+}
+
+# Resolve the single .vite/build file whose bytes carry an anchor, and
+# echo its path relative to the resources CWD.
+#
+# There is deliberately no "the main JS file" any more. Pre-3.x bundles
+# kept the whole main process in .vite/build/index.js; 1.19367.0 split it
+# into a stub plus one content-hashed main chunk; 1.26832.0 dissolved
+# that core entirely — index.js became a 190 KB file require()ing 83
+# chunks, across two chunk families (index.chunk-* and index2.chunk-*),
+# with the tray anchor left behind in index.js itself. A single resolved
+# path cannot serve every patch, so each anchor resolves its own file
+# (#820, docs/learnings/patching-minified-js.md).
+#
+# Takes a PCRE for the FULL anchor shape, not just its distinctive
+# string: on 1.26832.0 the literal `pop-up-menu` occurs in two chunks but
+# only one carries the setAlwaysOnTop call quick-window rewrites, so
+# resolving on the string alone picks a decoy. Asserting exactly one
+# match is what replaces the old multi-chunk guard: zero or many is a
+# hard error rather than a silent mispatch.
+#
+# Anchors must be written with a quote class ([`"']) rather than a bare
+# double quote — 1.26832.0 swapped the minifier and re-emitted nearly
+# every string literal as a backtick template.
+_resolve_anchor_file() {
+	local label="$1"
+	local pattern="$2"
+	local build_dir='app.asar.contents/.vite/build'
+
+	if [[ ! -d $build_dir ]]; then
+		echo "No $build_dir — upstream layout changed?" >&2
 		return 1
 	fi
 
-	local -a chunks
-	mapfile -t chunks < <(
-		grep -oP 'require\("\./\Kindex\.chunk-[^"]+\.js(?="\))' "$stub"
+	# -z treats each file as one record so an anchor's \s* can span a
+	# newline. Shipped bytes are single-line, but a beautified reference
+	# bundle wraps the same expression across lines and a line-oriented
+	# grep would report it missing (the beautified false-negative trap in
+	# docs/learnings/patching-minified-js.md).
+	local -a hits
+	mapfile -t hits < <(
+		grep -rlPz --include='*.js' -- "$pattern" "$build_dir" 2>/dev/null \
+			| sort
 	)
 
-	if (( ${#chunks[@]} == 0 )); then
-		# Pre-split layout: index.js is the main process itself.
-		printf '%s\n' "$stub"
-		return 0
+	if (( ${#hits[@]} == 0 )); then
+		echo "Anchor '$label' matched no file under $build_dir —" \
+			'upstream reshaped or removed it. Re-derive the anchor' \
+			'before shipping (#820).' >&2
+		return 1
 	fi
-	if (( ${#chunks[@]} > 1 )); then
-		echo "index.js requires ${#chunks[@]} main chunks" \
-			"(${chunks[*]}) — upstream split the main bundle across" \
-			'files; patches need per-anchor resolution. Re-point' \
-			'scripts/patches/*.sh before shipping.' >&2
+	if (( ${#hits[@]} > 1 )); then
+		echo "Anchor '$label' matched ${#hits[@]} files (${hits[*]}) —" \
+			'ambiguous. Tighten the anchor to the full shape so it' \
+			'selects one file (#820).' >&2
 		return 1
 	fi
 
-	local chunk="$build_dir/${chunks[0]}"
-	if [[ ! -f $chunk ]]; then
-		echo "index.js requires ${chunks[0]} but $chunk is missing" >&2
-		return 1
-	fi
-	printf '%s\n' "$chunk"
+	printf '%s\n' "${hits[0]}"
 }
 
 patch_app_asar() {
@@ -164,17 +217,30 @@ patch_app_asar() {
 		exit 1
 	fi
 
-	# Fail fast if upstream changed productName — a mismatch silently
-	# breaks StartupWMClass in every .desktop file we ship.
+	# Derive WM_CLASS from the field Chromium actually reads (see
+	# _derive_wm_class above). Exported because the packaging scripts
+	# that interpolate it into .desktop files and launcher-common.sh
+	# run as child processes of build.sh.
+	local desktop_name
+	desktop_name=$(_asar_package_json_field desktopName \
+		"$resources_dir/app.asar")
+	WM_CLASS=$(_derive_wm_class "$desktop_name") || exit 1
+	export WM_CLASS
+	echo "WM_CLASS '$WM_CLASS' derived from desktopName '$desktop_name'"
+
+	# productName stays tripwired separately: it no longer feeds
+	# WM_CLASS, but Electron's userData path (~/.config/Claude) keys on
+	# it, and the launcher, doctor, and docs all assume that location.
 	local product_name
 	product_name=$(_asar_package_json_field productName \
 		"$resources_dir/app.asar")
-	if [[ $product_name != "$WM_CLASS" ]]; then
-		echo "Error: upstream productName '$product_name' != WM_CLASS" \
-			"'$WM_CLASS' — update WM_CLASS in build.sh" >&2
+	if [[ $product_name != 'Claude' ]]; then
+		echo "Error: upstream productName '$product_name' != 'Claude'" \
+			'— the ~/.config/Claude userData assumption broke; re-audit' \
+			'the launcher and doctor paths before shipping.' >&2
 		exit 1
 	fi
-	echo "productName '$product_name' matches WM_CLASS"
+	echo "productName '$product_name' unchanged (userData path holds)"
 
 	# Runs against the pristine bytes, before any patch touches them.
 	_check_upstream_tripwires "$resources_dir/app.asar"
@@ -190,9 +256,18 @@ patch_app_asar() {
 	cd "$resources_dir" || exit 1
 	"$asar_exec" extract app.asar app.asar.contents || exit 1
 
-	# Resolve the code-split main chunk once; every patch reads $main_js.
-	main_js=$(_resolve_main_js) || exit 1
-	echo "Main-process JS: $main_js"
+	# Layout census, informational only — each patch resolves the file
+	# its own anchor lives in (see _resolve_anchor_file). Printed so a
+	# build log still records when upstream reshapes the bundle.
+	local build_dir='app.asar.contents/.vite/build'
+	# grep -o | wc -l, not grep -c: the bundle is near-single-line, so
+	# grep -c would report matching LINES (a handful) rather than matches.
+	local js_count chunk_count
+	js_count=$(find "$build_dir" -name '*.js' -type f | wc -l)
+	chunk_count=$(grep -oP 'require\("\./index2?\.chunk-[^"]+\.js"\)' \
+		"$build_dir/index.js" 2>/dev/null | wc -l)
+	echo "Bundle layout: $js_count JS files under .vite/build," \
+		"$chunk_count chunk requires from index.js"
 
 	local patch_fn
 	for patch_fn in "${active_patches[@]}"; do

@@ -71,15 +71,21 @@ assert_command_succeeds() {
 # upstream shape — no frame-fix files, no injected desktopName, no
 # stubbed claude-native. See docs/decisions.md D-002.
 # $1 = path to the resources/ dir containing app.asar
+# $2 = (optional) path to the installed .desktop file; when given and
+#      the asar could be extracted, StartupWMClass is checked against
+#      the package.json desktopName it must be derived from (#779)
 validate_app_contents() {
 	local resources_dir="$1"
+	local desktop_file="${2:-}"
 
 	assert_file_exists "$resources_dir/app.asar"
 	assert_dir_exists "$resources_dir/app.asar.unpacked"
 
 	# Official unpacked set: the real Rust native binding plus the
 	# node-pty prebuild (arch-dependent subdir, hence find). The 2.x
-	# stub index.js / cowork-vm-service.js are gone by design.
+	# unpacked stubs are gone by design; cowork-vm-service.js returned
+	# in #776 but lives at the resources/ root (asserted below), never
+	# in app.asar.unpacked.
 	local native_binding pty_prebuild
 	native_binding=$(find "$resources_dir/app.asar.unpacked" \
 		-name 'claude-native-binding.node' -type f | head -1)
@@ -109,6 +115,18 @@ validate_app_contents() {
 		fail 'Bundled virtiofsd missing from resources/'
 	fi
 
+	# The bwrap fallback daemon (#776): staged beside app.asar when
+	# patch_cowork_bwrap is active (it is, in every current build).
+	# The launcher spawns it via a system node, so presence is the
+	# contract — no exec bit required. Without it, an opt-in
+	# COWORK_VM_BACKEND=bwrap launch fails at spawn with doctor
+	# pointing at a reinstall.
+	if [[ -f $resources_dir/cowork-vm-service.js ]]; then
+		pass 'Bundled cowork-vm-service.js present (bwrap daemon)'
+	else
+		fail 'Bundled cowork-vm-service.js missing from resources/'
+	fi
+
 	# Extract app.asar for deeper inspection if tools available
 	local extract_dir
 	extract_dir=$(mktemp -d)
@@ -131,11 +149,32 @@ validate_app_contents() {
 			'"main": ".vite/build/' \
 			'package.json main points into .vite/build/'
 
-		# productName drives WM_CLASS; the build guard asserts the
-		# same invariant at patch time (app-asar.sh)
+		# productName drives Electron's userData path (~/.config/Claude);
+		# the build tripwires the same invariant at patch time
+		# (app-asar.sh)
 		assert_contains "$extract_dir/app/package.json" \
 			'"productName": "Claude"' \
 			'package.json productName is Claude'
+
+		# StartupWMClass must equal the asar desktopName minus its
+		# .desktop suffix — the field Chromium derives the runtime
+		# window class from. A drift here re-opens #779 (duplicate /
+		# generic taskbar icon on GNOME and KDE).
+		if [[ -n $desktop_file ]]; then
+			local desktop_name wm_class
+			desktop_name=$(grep -oP '"desktopName": "\K[^"]+' \
+				"$extract_dir/app/package.json")
+			wm_class="${desktop_name%.desktop}"
+			# Mirror _derive_wm_class's guard: the glob rejects both an
+			# empty value and one without a trailing .desktop suffix.
+			if [[ $desktop_name != *.desktop ]]; then
+				fail "asar desktopName '$desktop_name' is missing or has no .desktop suffix"
+			elif grep -qx "StartupWMClass=$wm_class" "$desktop_file"; then
+				pass "StartupWMClass matches asar desktopName ($wm_class)"
+			else
+				fail "StartupWMClass in $desktop_file does not match asar desktopName-derived '$wm_class'"
+			fi
+		fi
 
 		# Main process bundle exists
 		local main_bundle
@@ -151,6 +190,39 @@ validate_app_contents() {
 	fi
 
 	rm -rf "$extract_dir"
+}
+
+# Assert the launcher's --version fast-path (#775): it must print
+# "<package_name> <version>" and exit 0. The fast-path exits before
+# any launch, log-redirect, or sandbox logic, so unlike the launch
+# smoke test it needs no display, D-Bus, or privilege handling — run
+# the command directly. Closes the "deb/rpm static-verified only" gap
+# from the #775 review.
+#
+# Usage: run_version_flag_test <label> <expected_prefix> <cmd> [args...]
+#   expected_prefix  usually "<package_name> <version>"; matched as a
+#                    prefix so an rpm caller can pass the %{VERSION}
+#                    part and tolerate the raw hyphenated tail the
+#                    launcher bakes in (see scripts/packaging/rpm.sh).
+run_version_flag_test() {
+	local label="$1" expected="$2"
+	shift 2
+	# An empty metadata query (dpkg-deb -f / rpm -qp failure) would
+	# leave "name " as the expected prefix and make the match vacuous.
+	if [[ -z $expected || $expected == *' ' ]]; then
+		fail "$label --version: expected prefix '$expected' has no" \
+			'version component (metadata query returned empty?)'
+		return
+	fi
+	local out rc
+	out=$("$@" --version 2>&1)
+	rc=$?
+	if (( rc == 0 )) && [[ $out == "$expected"* ]]; then
+		pass "$label --version prints '$out' (exit 0)"
+	else
+		fail "$label --version: rc=$rc output='$out'" \
+			"(want prefix '$expected')"
+	fi
 }
 
 # Headless launch smoke test. Boots the packaged app under Xvfb + dbus
