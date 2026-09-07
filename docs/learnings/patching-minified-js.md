@@ -398,15 +398,61 @@ whose head is 80 bytes from an unrelated destructure. It also absorbs a
 Loosening buys back the match at the cost of the uniqueness the tight
 version got for free, so pay for it in two places at once:
 
-- **Keep a discriminator past the loosened joint.** C1's is the
-  `();return` tail. `startVM` in the same chunk opens identically and
-  destructures the same property, and is told apart only by continuing
-  into `if(` instead of `return`. Drop the tail and the gate installs on
-  the wrong function.
+- **Keep a discriminator past the loosened joint.** C1's was the
+  `();return` tail (since replaced by a log literal — next section).
+  `startVM` in the same chunk opened identically and destructured the
+  same property, and was told apart only by continuing into `if(`
+  instead of `return`. Drop the tail and the gate installs on the wrong
+  function.
 - **Assert exactly one match.** `replace()` silently takes the first.
   The count assertion is what turns a future second call site into a
   named warning instead of a coin flip — the same guard patches A and B
   already carried.
+
+### The terminus is an assumption too
+
+1.46388.2 broke C1 a third time, and this one had nothing to do with
+spacing. The destructure the anchor ended on was simply gone:
+
+```js
+1.37937.1:  async function QH(e,t){await nB();let{yukonSilver:r}=iB();return r?.status===`supported`&&(…
+1.46388.2:  async function YU(e,t){return await wB(),EB().status==="supported"&&(…
+```
+
+Same function, same guard, same log line — the status now comes off a
+helper call instead of a local. The `();return` discriminator that told
+the download function apart from `startVM` was pinned to a *statement
+shape*, and statement shapes are the minifier's to rearrange. Both the
+prelude and the terminus had been chosen as syntax; the only thing in
+the function that held across all three reshapes was the developer
+string in its body (`[downloadVM] Download already in progress`), with
+nothing but its delimiter moving.
+
+So the terminus is now that literal, and the head→literal stretch is
+fenced instead of pinned:
+
+```
+async function\s+[\w$]+\([\w$]+,[\w$]+\)\{ (?:[^{}]|\{yukonSilver:[\w$]+\}){0,240}? \[downloadVM\] Download already in progress
+```
+
+Three things carry over from the prelude lesson. The fence is still
+`[^{}]`, and the one brace pair it admits is spelled out as the
+destructure the older shapes carry — a fence that admitted any `{…}`
+pair would step over `if(e){t()}` exactly as `.` would. The
+exactly-one assertion stays. And the literal is a *prefix* of the
+message, cut before `, waiting...`, so a future re-emission as a
+template with an interpolation hole cannot split it.
+
+One new trap the widening exposed: a body budget generous enough for
+the real function is also generous enough to absorb the patch's own
+injected gate on a re-run, which makes the marker allowance from the
+next section silently redundant — until upstream grows the prelude and
+the second pass fails at resolution. The mutation check is what
+surfaced it: dropping the allowance went green. The gate is now braced
+(`if(…){return!1}`) so the fence cannot swallow it, and dropping the
+allowance goes red in the idempotency test instead of in a future
+build. When a mutation on defensive code comes back green, ask what
+*else* is covering for it, and whether that cover has a budget.
 
 ### A resolution anchor must survive its own patch
 
@@ -436,9 +482,10 @@ usually *adjacent* to the patch site rather than at it:
 | tray | the two adjacent `TrayIconLinux*.png` literals | the condition is rewritten, the literals are re-emitted |
 
 Where that is impossible, teach the anchor to tolerate the patch's own
-marker — `cowork-bwrap` C1 allows an optional
-`/*cowork-bwrap-dl*/...;` segment between the function head and the
-destructure it anchors on.
+marker — `cowork-bwrap` C1 allows an optional braced
+`/*cowork-bwrap-dl*/if(…){return!1}` segment between the function head
+and the body it fences (the braces are what keep that allowance
+load-bearing — see the previous section).
 
 One mechanical footnote: resolve with `grep -lPz`, not `grep -lP`. Bare
 `-P` is line-oriented, so a `\s*` in the anchor cannot cross a newline

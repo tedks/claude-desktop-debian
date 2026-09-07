@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — 
 
 <!-- Updated automatically by check-claude-version; will be current at release time. -->
 
+## [v3.2.4] — 2026-09-06
+
+### Fixed
+
+- Packages build again on upstream 1.46388.2. Every build leg had failed at the patch stage since the 1.46388.2 bump on 2026-09-05, on the same anchor that took the build red through 1.37937.1–1.40609.1 — `cowork-bwrap` C1, the foreground VM-download guard. The function is unchanged and still present; upstream folded the yukonSilver destructure the anchor ended on into a helper call (`async function QH(e,t){await nB();let{yukonSilver:r}=iB();return …` became `async function YU(e,t){return await wB(),EB().status==="supported"&&…`), so an anchor whose terminus was that destructure had nothing left to end on and `_resolve_anchor_file` failed the build as designed. Both the resolver and the patch regex now run from the function head to the `[downloadVM] Download already in progress` log literal — the one token that held across every reshape, with only its delimiter moving — over a brace-fenced body that admits exactly one brace pair (the destructure the older shapes still carry), so the 1.37937.x shape remains covered. The injected gate is braced (`if(…){return!1}`) on purpose: the widened body budget would otherwise absorb it on a re-run and leave the marker allowance silently redundant until a longer upstream prelude overran the budget at resolution. Verified against the pinned 1.46388.2 and the previous 1.37937.3 official `.deb`s via `tests/test-patch-stage.sh`: all three load-bearing sub-patches apply, every JS file in the repacked asar parses, every marker survives, and a second pass is byte-identical. Fixtures re-transcribed from the shipped bytes of both releases; six mutation checks — swapping the fence for `.`, dropping the destructure allowance, shrinking the budget, dropping the marker tolerance, dropping the count assertion, dropping the literal terminus — each turn a test red.
+
 ## [v3.2.3] — 2026-09-03
 
 ### Fixed
