@@ -176,18 +176,18 @@ echo 'export CLAUDE_DISABLE_GPU=1' >> ~/.profile
 ```
 
 When `CLAUDE_DISABLE_GPU=1` is set, the launcher passes
-`--disable-gpu --disable-software-rasterizer` to the official binary
-(see `scripts/launcher-common.sh`). This is the same pair of flags
+`--disable-gpu` to the official binary
+(see `scripts/launcher-common.sh`). This is the same flag
 applied automatically inside XRDP sessions, where software
 rendering is required regardless. Either signal is sufficient —
 the launcher won't stack duplicate flags.
 
 If the previous launch already died with the GPU-process FATAL
 signature and `CLAUDE_DISABLE_GPU` is unset, the next launch
-auto-applies the same flags and keeps them applied on subsequent
+auto-applies the same flag and keeps it applied on subsequent
 launches. Set `CLAUDE_DISABLE_GPU=0` to suppress the auto-fallback
 when retesting hardware acceleration after a driver fix — any
-explicitly set value suppresses it; only `1` forces the flags on.
+explicitly set value suppresses it; only `1` forces the flag on.
 
 **When to prefer which:** the in-app toggle is friendlier if you
 can reach Settings without the app crashing. Reach for
@@ -423,9 +423,15 @@ run with `--no-sandbox`, see
 ["AppImage Sandbox Warning"](#appimage-sandbox-warning) — so there's
 nothing AppImage-specific to add there either.)
 
-No package ships a bwrap profile as of v3.0.0+; the deb's `postrm` still
-removes the 2.x-era `/etc/apparmor.d/claude-desktop-bwrap` leftover (and a
-`claude-desktop-unofficial-bwrap` sibling, if one exists) on purge.
+No package ships a bwrap profile as of v3.0.0+. The deb's `postrm` removes
+the 2.x-era `/etc/apparmor.d/claude-desktop-bwrap` leftover (and a
+`claude-desktop-unofficial-bwrap` sibling, if one exists) on purge, and
+since [#825](https://github.com/aaddrick/claude-desktop-debian/pull/825)
+`postinst` also clears it on upgrade — `postrm` alone never fired on that
+path, so the leftover used to survive indefinitely. See
+["Blank icons / unloggable GDM greeter after upgrading to Ubuntu
+26.04"](#blank-icons--unloggable-gdm-greeter-after-upgrading-to-ubuntu-2604)
+if you are already in that state.
 
 **Credit:** [@hfyeh](https://github.com/hfyeh)
 ([#351](https://github.com/aaddrick/claude-desktop-debian/issues/351)) for
@@ -434,6 +440,56 @@ the original profile workaround;
 over-scope and the opam/Apptainer precedent, in
 [PR #434](https://github.com/aaddrick/claude-desktop-debian/pull/434#issuecomment-4352273336)
 (tracked in [#542](https://github.com/aaddrick/claude-desktop-debian/issues/542)).
+
+### Blank icons / unloggable GDM greeter after upgrading to Ubuntu 26.04
+
+Tracked in
+[#542](https://github.com/aaddrick/claude-desktop-debian/issues/542).
+
+**Symptoms, all at once, immediately after an Ubuntu release upgrade:**
+
+- the GDM greeter shows text and buttons but **no user list, no
+  background, and no icons**, so there is no way to log in graphically;
+- `gnome-terminal` does not open — `gnome-terminal-server` aborts with a
+  GTK assertion at `gtkiconhelper.c` while loading `image-missing.png`;
+- icons are blank across the shell and in GTK apps;
+- gnome-keyring never shows its password prompt, so passphrase-protected
+  ssh keys stop working (`agent refused operation`).
+
+**Cause.** A 2.x-era install of this package left
+`/etc/apparmor.d/claude-desktop-bwrap` behind, which attaches a profile to
+the shared `/usr/bin/bwrap`. Ubuntu's own `bwrap-userns-restrict` claims
+the same path, so AppArmor resolves neither and bwrap falls through to
+`unprivileged_userns`. GNOME 47+ decodes every image through glycin inside
+a bwrap sandbox, so nothing that is an image can load. The profile is inert
+on Ubuntu 24.04 (no glycin), which is why it only breaks at upgrade time
+and why nothing points at Claude Desktop.
+
+**Confirm it** from a TTY (`Ctrl+Alt+F3`):
+
+```bash
+journalctl -b | grep -c 'conflicting profile attachments'   # non-zero
+ls /etc/apparmor.d/claude-desktop-bwrap                     # exists
+```
+
+**Fix:**
+
+```bash
+sudo apparmor_parser -R /etc/apparmor.d/claude-desktop-bwrap
+sudo rm /etc/apparmor.d/claude-desktop-bwrap
+sudo systemctl restart gdm
+```
+
+`apparmor_parser -R` is required in addition to the delete. Removing the
+file alone leaves the profile loaded in the kernel, so the conflict —
+and the broken desktop — survives until the next reboot.
+
+Upgrading the package fixes this going forward: `postinst` clears the
+leftover as of
+[#825](https://github.com/aaddrick/claude-desktop-debian/pull/825). Keep
+`/etc/apparmor.d/claude-desktop` (and
+`/etc/apparmor.d/claude-desktop-unofficial`) — those attach to this
+application's own binary and are correct.
 
 ### Cowork: ENAMETOOLONG on encrypted home (eCryptfs)
 
