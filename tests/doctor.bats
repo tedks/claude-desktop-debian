@@ -6,6 +6,8 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
 
+load 'test_helper'
+
 setup() {
 	TEST_TMP=$(mktemp -d)
 	export TEST_TMP
@@ -44,6 +46,7 @@ setup() {
 }
 
 teardown() {
+	_kill_stand_ins
 	if [[ -n "$TEST_TMP" && -d "$TEST_TMP" ]]; then
 		rm -rf "$TEST_TMP"
 	fi
@@ -737,14 +740,48 @@ SHIM
 	[[ $output == *'no lock file'* ]]
 }
 
-@test "_doctor_check_singleton_lock: symlink to a live PID — PASS" {
+# Pull the real launcher-common.sh into this test shell.
+#
+# The lock check delegates to _pid_is_claude_desktop, which lives in
+# launcher-common.sh beside the other /proc/PID/exe readers. At runtime
+# it is always in scope (launcher-common.sh sources doctor.sh), but
+# this file sources doctor.sh standalone, so the SingletonLock tests
+# source the real launcher-common.sh instead: a local stub would only
+# mirror the prod call, and a `declare -F` fallback in doctor.sh would
+# make these tests decoration.
+_source_launcher_common() {
+	# shellcheck source=scripts/launcher-common.sh
+	source "$SCRIPT_DIR/../scripts/launcher-common.sh"
+}
+
+@test "_doctor_check_singleton_lock: symlink to a live Claude Desktop PID — PASS" {
 	mkdir -p "$XDG_CONFIG_HOME/Claude"
-	# $$ is this test process: guaranteed alive for the kill -0 probe.
-	ln -s "myhost-$$" "$XDG_CONFIG_HOME/Claude/SingletonLock"
+	_source_launcher_common
+	_spawn_claude_desktop_stand_in
+	ln -s "myhost-$claude_pid" "$XDG_CONFIG_HOME/Claude/SingletonLock"
 	run _doctor_check_singleton_lock "$XDG_CONFIG_HOME/Claude"
 	[[ $status -eq 0 ]]
 	[[ $output == *'[PASS]'* ]]
 	[[ $output == *'running process'* ]]
+}
+
+@test "_doctor_check_singleton_lock: symlink to a live PID that is not Claude Desktop — WARN, not PASS" {
+	# #784: kill -0 alone false-PASSes a stale lock whose PID has
+	# since been recycled by any other process of the same user.
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	_source_launcher_common
+	_spawn_plain_sleep
+	ln -s "myhost-$plain_pid" "$XDG_CONFIG_HOME/Claude/SingletonLock"
+	# Precondition: the PID really is signalable, so this test can
+	# only pass via the executable check.
+	kill -0 "$plain_pid"
+	run _doctor_check_singleton_lock "$XDG_CONFIG_HOME/Claude"
+	[[ $status -eq 0 ]]
+	[[ $output == *'[WARN]'* ]]
+	[[ $output != *'[PASS]'* ]]
+	[[ $output == *'stale lock'* ]]
+	[[ $output == *"PID $plain_pid is not a Claude Desktop process"* ]]
+	[[ $output == *"Fix: rm '$XDG_CONFIG_HOME/Claude/SingletonLock'"* ]]
 }
 
 @test "_doctor_check_singleton_lock: symlink to a dead PID — WARN, not PASS" {
@@ -1762,4 +1799,44 @@ _stub_stat() {
 	[[ $output == *'[FAIL]'* ]]
 	[[ $output == *'perms=0755'* ]]
 	[[ $output != *'[PASS]'* ]]
+}
+
+@test "_doctor_check_chrome_sandbox: appimage package type — INFO, no stat, no FAIL" {
+	# #785: the AppImage stages chrome-sandbox but its permission
+	# normalization drops the setuid bit and the mount/extract dir is
+	# owned by the running user, so the perms check always FAILed with
+	# an unactionable `sudo chown root:root /tmp/.mount_.../` hint --
+	# and it is moot anyway (--no-sandbox is unconditional there).
+	# A 0644 adjacent sandbox, the worst case, must still produce a
+	# single _info line and no stat call at all.
+	_DOCTOR_DEB_SANDBOX="$TEST_TMP/no-deb-sandbox"
+	mkdir -p "$TEST_TMP/app"
+	: > "$TEST_TMP/app/chrome-sandbox"
+	chmod 0644 "$TEST_TMP/app/chrome-sandbox"
+	# Tripwire: any stat call would print this and break the
+	# assertions below, so the "no stat" half is enforced, not
+	# decoration.
+	stat() { echo 'STAT-WAS-CALLED'; }
+	run _doctor_check_chrome_sandbox "$TEST_TMP/app/electron" 'appimage'
+	[[ $status -eq 0 ]]
+	[[ $output != *'STAT-WAS-CALLED'* ]]
+	[[ $output != *'[FAIL]'* ]]
+	[[ $output != *'[WARN]'* ]]
+	[[ $output != *'[PASS]'* ]]
+	[[ $output != *'sudo chown'* ]]
+	[[ $output == *'not used'* ]]
+	[[ $output == *'--no-sandbox'* ]]
+	[[ $(grep -c 'Chrome sandbox' <<< "$output") -eq 1 ]]
+}
+
+@test "_doctor_check_chrome_sandbox: deb type still judges perms (#785 gate is appimage-only)" {
+	# Guards the gate's blast radius: the same bad 0644 sandbox must
+	# still FAIL when the package type is deb.
+	_DOCTOR_DEB_SANDBOX="$TEST_TMP/no-deb-sandbox"
+	mkdir -p "$TEST_TMP/app"
+	: > "$TEST_TMP/app/chrome-sandbox"
+	chmod 0644 "$TEST_TMP/app/chrome-sandbox"
+	run _doctor_check_chrome_sandbox "$TEST_TMP/app/electron" 'deb'
+	[[ $output == *'[FAIL]'* ]]
+	[[ $output == *'perms=644'* ]]
 }

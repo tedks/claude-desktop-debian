@@ -733,11 +733,12 @@ _doctor_check_disk_space() {
 
 # Check the Chromium single-instance SingletonLock under the Claude
 # config dir. Electron writes it as a 'hostname-PID' symlink; a stale
-# one (dead PID) is self-healed — Chromium unlinks the orphan and
-# continues. The case that actually blocks startup is a non-symlink
-# regular file (possible after an unclean update): ReadLink returns
-# empty, the lock parse fails, and the symlink() retry hits EEXIST,
-# so the app quits on the next cold launch. That case must not be
+# one (dead PID, or a PID since recycled by an unrelated process) is
+# self-healed — Chromium unlinks the orphan and continues. The case
+# that actually blocks startup is a non-symlink regular file
+# (possible after an unclean update): ReadLink returns empty, the
+# lock parse fails, and the symlink() retry hits EEXIST, so the app
+# quits on the next cold launch. That case must not be
 # reported as "no lock file", which was a silent false PASS.
 #
 # Usage: _doctor_check_singleton_lock [config_dir]
@@ -749,7 +750,24 @@ _doctor_check_singleton_lock() {
 		lock_target="$(readlink "$lock_file" 2>/dev/null)" || true
 		lock_pid="${lock_target##*-}"
 		if [[ $lock_pid =~ ^[0-9]+$ ]] && kill -0 "$lock_pid" 2>/dev/null; then
-			_pass "SingletonLock: held by running process (PID $lock_pid)"
+			# Signalable is not enough (#784): a recycled PID held
+			# by any other same-user process made a stale lock PASS.
+			# _pid_is_claude_desktop lives in launcher-common.sh
+			# beside the other /proc/PID/exe readers. Guarded like
+			# load_launcher_config: a standalone `source doctor.sh`
+			# has no launcher-common.sh in scope and keeps the old
+			# verdict; doctor.bats sources the real file for these
+			# cases, so the guard never hides the branch from tests.
+			if ! declare -F _pid_is_claude_desktop > /dev/null \
+				|| _pid_is_claude_desktop "$lock_pid"; then
+				_pass "SingletonLock: held by running process" \
+					"(PID $lock_pid)"
+			else
+				_warn "SingletonLock: stale lock found" \
+					"(PID $lock_pid is not a Claude" \
+					'Desktop process)'
+				_info "Fix: rm '$lock_file'"
+			fi
 		else
 			_warn "SingletonLock: stale lock found" \
 				"(PID $lock_pid is not running)"
@@ -1442,15 +1460,31 @@ _doctor_check_electron_binary() {
 # deb path would validate the wrong binary when an AppImage/Nix run
 # coexists with a stale deb tree. Without an electron path, the deb
 # install location is the best guess. Warns when the relevant file is
-# missing (expected for AppImage).
+# missing — meaningful for deb/rpm/nix, where the helper is supposed to
+# be installed.
+#
+# AppImage is exempt (#785): the staged tree carries chrome-sandbox but
+# the AppImage's permission normalization drops the setuid bit, and the
+# mount/extract dir is owned by the running user, so the perms check
+# always failed with a `sudo chown root:root /tmp/.mount_.../` hint that
+# is both unactionable (transient, read-only) and moot —
+# build_electron_args passes --no-sandbox unconditionally for appimage,
+# so the helper is never invoked. Report that once and stop, matching
+# _doctor_check_effective_sandbox's appimage short-circuit.
 #
 # _DOCTOR_DEB_SANDBOX overrides the hardcoded deb path (test hook; the
 # default is the real install location, so production is unaffected).
 #
-# Usage: _doctor_check_chrome_sandbox [electron_path]
+# Usage: _doctor_check_chrome_sandbox [electron_path] [package_type]
 _doctor_check_chrome_sandbox() {
 	local electron_path="${1:-}"
+	local package_type="${2:-}"
 	local sandbox_path
+	if [[ $package_type == 'appimage' ]]; then
+		_info 'Chrome sandbox: not used' \
+			'(AppImage runs with --no-sandbox)'
+		return 0
+	fi
 	if [[ -n $electron_path ]]; then
 		# A specific binary is running: only its own chrome-sandbox is
 		# relevant.
@@ -1474,7 +1508,7 @@ _doctor_check_chrome_sandbox() {
 			_info "     sudo chmod 4755 $sandbox_path"
 		fi
 	else
-		_warn 'Chrome sandbox not found (expected for AppImage)'
+		_warn "Chrome sandbox not found at $sandbox_path"
 	fi
 }
 
@@ -1563,7 +1597,9 @@ _doctor_check_display_server() {
 # Arguments: $1 = electron path (optional, for package-specific checks)
 #            $2 = package type: deb|rpm|nix|appimage (optional, default
 #                 'deb' -- matches every call site except appimage.sh;
-#                 only affects _doctor_check_effective_sandbox's #804 check)
+#                 read by _doctor_check_effective_sandbox's #804 check
+#                 and by _doctor_check_chrome_sandbox's appimage
+#                 exemption (#785))
 run_doctor() {
 	local electron_path="${1:-}"
 	local package_type="${2:-deb}"
@@ -1616,7 +1652,7 @@ run_doctor() {
 	_doctor_check_electron_binary "$electron_path"
 
 	# -- Chrome sandbox permissions --
-	_doctor_check_chrome_sandbox "$electron_path"
+	_doctor_check_chrome_sandbox "$electron_path" "$package_type"
 
 	# -- Chrome sandbox effective runtime state (#804) --
 	# detect_display_backend sets is_wayland/use_x11_on_wayland, which
