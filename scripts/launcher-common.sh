@@ -744,6 +744,53 @@ cleanup_stale_cowork_socket() {
 	log_message "Removed stale cowork-vm-service socket (no daemon running)"
 }
 
+# #855: reclaim disk space left behind when a vm_bundles bundle
+# migrated from the pre-3.0 win32-manifest-repurposed rootfs.vhdx
+# format to the official unix-native rootfs.img format.
+#
+# Before the v3.0.0 official-deb rebase, Linux Cowork worked by
+# repurposing the win32 manifest's VHDX entries (no native "unix"
+# manifest existed yet) and converting them to qcow2 on first use.
+# Anthropic's manifest has since grown a real "unix" platform entry
+# serving rootfs.img directly, and the official coworkd uses that
+# format without ever touching the old VHDX pair again once it
+# exists. Nothing deletes the superseded files, so a bundle that
+# predates the switch keeps ~11 GB of dead rootfs.vhdx /
+# rootfs.vhdx.zst forever.
+#
+# rootfs.img present is treated as proof the migration completed; a
+# bundle still on the old format alone (no rootfs.img yet) is left
+# untouched so an in-progress or vhdx-only install isn't disturbed.
+# The only code that ever read rootfs.vhdx on Linux is the 2.x KVM
+# backend in scripts/cowork-fallback/cowork-vm-service.js (vhdx ->
+# qcow2 on first use). It still exists but is unreachable in 3.x:
+# the daemon only spawns behind the asar gate
+# COWORK_VM_BACKEND=bwrap, and that value selects the bwrap backend
+# inside it. So no reachable path needs the vhdx once img exists.
+#
+# Fail-safe: never blocks launch.
+cleanup_stale_vm_bundle_images() {
+	local bundles_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude/vm_bundles"
+	[[ -d $bundles_dir ]] || return 0
+
+	local bundle f removed
+	for bundle in "$bundles_dir"/*/; do
+		bundle=${bundle%/}
+		[[ -f "$bundle/rootfs.img" ]] || continue
+
+		removed=()
+		for f in "$bundle/rootfs.vhdx" "$bundle/rootfs.vhdx.zst"; do
+			[[ -f $f ]] || continue
+			rm -f "$f" 2>/dev/null && removed+=("${f##*/}")
+		done
+
+		if ((${#removed[@]} > 0)); then
+			log_message \
+				"Removed stale VM image(s) in ${bundle}: ${removed[*]} (#855)"
+		fi
+	done
+}
+
 # P1 (#768): rotate out-of-band backups of the user config and the
 # per-account Cowork store index files before launch, so the
 # poisoned-cache / corrupt-load wipe class is recoverable. Upstream's
@@ -899,11 +946,81 @@ _electron_launcher_forward_signal() {
 	fi
 }
 
-run_electron_and_cleanup() {
-	local status
+# Bound what a session can write to launcher.log (#864). Electron's
+# whole stdout/stderr lands in the log for the life of the session,
+# and a Chromium message stuck in a loop wrote 32 GB in a morning on
+# one machine: the launch-time rotation (#747) only ever sees the
+# file at the next start. Two defences, in order:
+#
+#   1. Runs of identical lines collapse to the line plus one
+#      "[launcher] last line repeated N more times" summary, so a
+#      single-line loop costs two lines however long it spins.
+#   2. After ELECTRON_LOG_CAP_BYTES of output (20 MiB default) the
+#      filter stops WRITING but keeps READING: a marker line records
+#      the cap, and every later line is consumed and dropped. The
+#      pipe is never closed, so Electron never sees SIGPIPE.
+#
+# fflush() per line keeps the log live for `tail -f`. mawk and gawk
+# both support it. Reads stdin, writes stdout; the caller aims stdout
+# at the log.
+_electron_output_filter() {
+	local max="${ELECTRON_LOG_CAP_BYTES:-$((20 * 1024 * 1024))}"
 
-	"$@" >> "$log_file" 2>&1 &
-	_electron_child_pid=$!
+	awk -v max="$max" '
+		function emit(line) {
+			print line
+			fflush()
+			written += length(line) + 1
+		}
+		function end_run() {
+			if (repeat > 1) {
+				emit("[launcher] last line repeated " (repeat - 1) \
+					" more times")
+			}
+			repeat = 0
+		}
+		{
+			if (have_prev && $0 == prev) {
+				repeat++
+				next
+			}
+			if (have_prev) end_run()
+			prev = $0
+			have_prev = 1
+			repeat = 1
+			if (written >= max) {
+				if (!capped) {
+					emit("[launcher] output cap (" max " bytes) reached;" \
+						" further output dropped this session (#864)")
+					capped = 1
+				}
+				next
+			}
+			emit($0)
+		}
+		END { end_run() }
+	'
+}
+
+run_electron_and_cleanup() {
+	local status fifo_dir fifo filter_pid=''
+
+	# A named pipe rather than > >(...) so the filter pid is known and
+	# the log can be drained before the exit line is written. Fail-safe:
+	# if the pipe cannot be made, fall back to the bare redirect rather
+	# than block launch.
+	if fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/claude-launcher.XXXXXX" \
+		2>/dev/null) && mkfifo "$fifo_dir/electron.out" 2>/dev/null; then
+		fifo="$fifo_dir/electron.out"
+		_electron_output_filter < "$fifo" >> "$log_file" &
+		filter_pid=$!
+		"$@" > "$fifo" 2>&1 &
+		_electron_child_pid=$!
+	else
+		[[ -n ${fifo_dir:-} ]] && rm -rf "$fifo_dir"
+		"$@" >> "$log_file" 2>&1 &
+		_electron_child_pid=$!
+	fi
 
 	trap '_electron_launcher_forward_signal TERM' TERM
 	trap '_electron_launcher_forward_signal INT' INT
@@ -916,6 +1033,20 @@ run_electron_and_cleanup() {
 	done
 
 	trap - TERM INT HUP
+
+	# Drain the filter so Electron's last lines land before the exit
+	# line. Bounded: a helper that inherited the pipe's write end and
+	# outlives the main process would keep it open, and the cleanup
+	# below is what reaps those; the filter finishes on its own once
+	# the last writer closes.
+	if [[ -n $filter_pid ]]; then
+		local i
+		for (( i = 0; i < 20; i++ )); do
+			kill -0 "$filter_pid" 2>/dev/null || break
+			sleep 0.1
+		done
+		rm -rf "$fifo_dir"
+	fi
 
 	log_message "Electron exited with code: $status"
 	cleanup_after_electron_exit

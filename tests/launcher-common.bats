@@ -781,6 +781,80 @@ s.close()
 }
 
 # =============================================================================
+# cleanup_stale_vm_bundle_images (#855)
+# =============================================================================
+
+@test "cleanup_stale_vm_bundle_images: no vm_bundles dir - returns 0" {
+	run cleanup_stale_vm_bundle_images
+	[[ $status -eq 0 ]]
+}
+
+@test "cleanup_stale_vm_bundle_images: bundle with only rootfs.vhdx is left alone" {
+	# Migration hasn't happened yet (no rootfs.img) - don't touch it.
+	local bundle="$XDG_CONFIG_HOME/Claude/vm_bundles/claudevm.bundle"
+	mkdir -p "$bundle"
+	echo vhdx > "$bundle/rootfs.vhdx"
+	echo vhdxzst > "$bundle/rootfs.vhdx.zst"
+
+	setup_logging
+	cleanup_stale_vm_bundle_images
+	[[ -f "$bundle/rootfs.vhdx" ]]
+	[[ -f "$bundle/rootfs.vhdx.zst" ]]
+}
+
+@test "cleanup_stale_vm_bundle_images: removes stale vhdx pair once rootfs.img exists" {
+	local bundle="$XDG_CONFIG_HOME/Claude/vm_bundles/claudevm.bundle"
+	mkdir -p "$bundle"
+	echo img > "$bundle/rootfs.img"
+	echo vhdx > "$bundle/rootfs.vhdx"
+	echo vhdxzst > "$bundle/rootfs.vhdx.zst"
+
+	setup_logging
+	cleanup_stale_vm_bundle_images
+	[[ ! -f "$bundle/rootfs.vhdx" ]]
+	[[ ! -f "$bundle/rootfs.vhdx.zst" ]]
+	[[ -f "$bundle/rootfs.img" ]]
+	grep -q "Removed stale VM image(s)" "$log_file"
+}
+
+@test "cleanup_stale_vm_bundle_images: bundle already migrated (no vhdx) - no-op, no log" {
+	local bundle="$XDG_CONFIG_HOME/Claude/vm_bundles/claudevm.bundle"
+	mkdir -p "$bundle"
+	echo img > "$bundle/rootfs.img"
+
+	setup_logging
+	cleanup_stale_vm_bundle_images
+	[[ -f "$bundle/rootfs.img" ]]
+	! grep -q "Removed stale VM image" "$log_file"
+}
+
+@test "cleanup_stale_vm_bundle_images: only removes vhdx in bundles with rootfs.img, leaves siblings alone" {
+	local bundles="$XDG_CONFIG_HOME/Claude/vm_bundles"
+	mkdir -p "$bundles/migrated" "$bundles/not-migrated"
+	echo img > "$bundles/migrated/rootfs.img"
+	echo vhdx > "$bundles/migrated/rootfs.vhdx"
+	echo vhdx > "$bundles/not-migrated/rootfs.vhdx"
+
+	setup_logging
+	cleanup_stale_vm_bundle_images
+	[[ ! -f "$bundles/migrated/rootfs.vhdx" ]]
+	[[ -f "$bundles/not-migrated/rootfs.vhdx" ]]
+}
+
+@test "cleanup_stale_vm_bundle_images: log names the bundle without the glob's trailing slash" {
+	# The glob yields ".../claudevm.bundle/"; without the strip the log
+	# reads "claudevm.bundle/: rootfs.vhdx". Pin the exact tail.
+	local bundle="$XDG_CONFIG_HOME/Claude/vm_bundles/claudevm.bundle"
+	mkdir -p "$bundle"
+	echo img > "$bundle/rootfs.img"
+	echo vhdx > "$bundle/rootfs.vhdx"
+
+	setup_logging
+	cleanup_stale_vm_bundle_images
+	grep -qF "in $bundle: rootfs.vhdx (#855)" "$log_file"
+}
+
+# =============================================================================
 # cleanup_orphaned_cowork_daemon
 #
 # Reaps a cowork-vm-service daemon left behind by a crashed UI, but only
@@ -1136,6 +1210,133 @@ STUB
 }
 
 # =============================================================================
+# run_electron_and_cleanup: bounded session log (#864)
+# =============================================================================
+#
+# Electron's whole stdout/stderr goes into launcher.log for the life of
+# the session; a looping Chromium message wrote 32 GB in a morning. The
+# filter must collapse repeats, stop writing at the cap, and never
+# close the pipe on the child. Each test's stub finishes by touching a
+# marker and exiting with a distinct code, so "the child survived and
+# ran to completion" is asserted directly rather than inferred.
+
+# Write a stub "electron" that runs $1 as its body, then touches
+# $TEST_TMP/done and exits $2.
+_stub_electron() {
+	local body="$1" code="$2"
+	cat > "$TEST_TMP/electron" <<STUB
+#!/usr/bin/env bash
+$body
+touch "$TEST_TMP/done"
+exit $code
+STUB
+	chmod +x "$TEST_TMP/electron"
+	cleanup_after_electron_exit() { :; }
+}
+
+@test "run_electron_and_cleanup: identical lines collapse to one plus a repeat count" {
+	_stub_electron 'for ((i = 0; i < 1000; i++)); do echo "GPU process exited unexpectedly"; done' 5
+	setup_logging
+	run run_electron_and_cleanup "$TEST_TMP/electron"
+	[[ $status -eq 5 ]]
+	[[ -f $TEST_TMP/done ]]
+	[[ $(grep -c 'GPU process exited unexpectedly' "$log_file") -eq 1 ]]
+	grep -qF '[launcher] last line repeated 999 more times' "$log_file"
+}
+
+@test "run_electron_and_cleanup: distinct lines stop at the cap, marker written, child completes" {
+	# 1000 distinct ~40-byte lines (~40 KB) against a 4 KiB cap.
+	_stub_electron 'for ((i = 0; i < 1000; i++)); do printf "distinct line %06d padding padding\n" "$i"; done' 6
+	setup_logging
+	ELECTRON_LOG_CAP_BYTES=4096
+	run run_electron_and_cleanup "$TEST_TMP/electron"
+	[[ $status -eq 6 ]]
+	[[ -f $TEST_TMP/done ]]
+	grep -qF '[launcher] output cap (4096 bytes) reached' "$log_file"
+	# Nothing after the marker but the launcher's own lines: the size
+	# is the cap plus one marker line plus the exit/end lines.
+	[[ $(stat -c '%s' "$log_file") -lt 5000 ]]
+	[[ $(grep -c 'distinct line' "$log_file") -lt 1000 ]]
+}
+
+@test "run_electron_and_cleanup: a child that floods past the cap still runs to completion" {
+	_stub_electron 'for ((i = 0; i < 3000; i++)); do printf "flood %06d padding padding padding\n" "$i"; done; echo "still alive after cap"' 8
+	setup_logging
+	ELECTRON_LOG_CAP_BYTES=2048
+	run run_electron_and_cleanup "$TEST_TMP/electron"
+	[[ $status -eq 8 ]]
+	[[ -f $TEST_TMP/done ]]
+	grep -qF 'output cap (2048 bytes) reached' "$log_file"
+	# Dropped, as designed.
+	! grep -qF 'still alive after cap' "$log_file" || return 1
+}
+
+@test "_electron_output_filter: never closes its stdin after the cap" {
+	# The property that keeps Electron off SIGPIPE/EPIPE. Tested on
+	# the filter itself with an endless writer through a plain pipe:
+	# a filter that keeps reading holds the pipeline open until
+	# `timeout` kills it (rc 124); one that exits at the cap breaks
+	# the pipe and the pipeline ends at once with some other status.
+	# (Not tested through the fifo on purpose: mawk lingers in
+	# pipe_read after `exit` when its stdin is a fifo, which would
+	# hide a closed-pipe regression behind an implementation quirk.)
+	# Distinct lines, or the dedupe would swallow them before the cap.
+	run timeout 1 bash -c '
+		source "'"$TEST_TMP"'/launcher-common.sh"
+		awk "BEGIN { for (i = 0; ; i++) print \"flood \" i \" padding padding\" }" \
+			| ELECTRON_LOG_CAP_BYTES=2048 _electron_output_filter \
+			> /dev/null'
+	[[ $status -eq 124 ]]
+}
+
+@test "run_electron_and_cleanup: child's last output lands before the exit line" {
+	_stub_electron 'echo "first"; echo "last line from electron"' 0
+	setup_logging
+	run run_electron_and_cleanup "$TEST_TMP/electron"
+	[[ $status -eq 0 ]]
+	local last exit_line
+	last=$(grep -n 'last line from electron' "$log_file" | cut -d: -f1)
+	exit_line=$(grep -n 'Electron exited with code: 0' "$log_file" | cut -d: -f1)
+	[[ -n $last && -n $exit_line ]]
+	(( last < exit_line ))
+}
+
+@test "run_electron_and_cleanup: falls back to a plain redirect when the pipe can't be made" {
+	# Point TMPDIR at a file so mktemp -d fails; launch must still work
+	# and still log, just unbounded (the pre-#864 behaviour).
+	_stub_electron 'echo "fallback path output"' 4
+	setup_logging
+	: > "$TEST_TMP/not-a-dir"
+	TMPDIR="$TEST_TMP/not-a-dir"
+	run run_electron_and_cleanup "$TEST_TMP/electron"
+	[[ $status -eq 4 ]]
+	[[ -f $TEST_TMP/done ]]
+	grep -qF 'fallback path output' "$log_file"
+	grep -qF 'Electron exited with code: 4' "$log_file"
+}
+
+@test "run_electron_and_cleanup: leaves no fifo directory behind" {
+	_stub_electron 'echo hi' 0
+	setup_logging
+	TMPDIR="$TEST_TMP"
+	run run_electron_and_cleanup "$TEST_TMP/electron"
+	[[ $status -eq 0 ]]
+	[[ -z $(ls -d "$TEST_TMP"/claude-launcher.* 2>/dev/null) ]]
+}
+
+@test "_electron_output_filter: default cap is 20 MiB" {
+	# Pin the default so a stray edit can't quietly make it 20 KiB or
+	# unbounded: 21 MiB of distinct input must trip the marker with
+	# the documented byte count.
+	unset ELECTRON_LOG_CAP_BYTES
+	local last
+	last=$(yes '0123456789012345678901234567890123456789012345678901234567890123' \
+		| head -c $((21 * 1024 * 1024)) | awk '{ print NR ": " $0 }' \
+		| _electron_output_filter | tail -n 1)
+	[[ $last == *'output cap (20971520 bytes) reached'* ]]
+}
+
+# =============================================================================
 # Doctor helper functions
 # =============================================================================
 
@@ -1256,6 +1457,159 @@ STUB
 	local result
 	result=$(_electron_version "$TEST_TMP/electron/electron") || true
 	[[ -z $result ]]
+}
+
+# =============================================================================
+# backup_user_config (P1 #768): rotate out-of-band copies of the user
+# config and the Cowork stores before launch, so the config-wipe class
+# stays recoverable (docs/learnings/config-wipe-guard.md)
+# =============================================================================
+
+# Absolute path of rotation slot $2 for the flattened backup name $1.
+# The literal cache-relative path is the pin: moving the backup tree
+# has to turn these tests red, so this must not re-derive it from the
+# function under test.
+_backup_slot() {
+	echo "$XDG_CACHE_HOME/claude-desktop-debian/config-backups/$1.$2"
+}
+
+# Contents of rotation slot $2 for the flattened backup name $1.
+_backup_body() {
+	cat "$(_backup_slot "$1" "$2")"
+}
+
+# Write $1 verbatim (no trailing newline) into the user config.
+_write_user_config() {
+	mkdir -p "$XDG_CONFIG_HOME/Claude"
+	printf '%s' "$1" \
+		> "$XDG_CONFIG_HOME/Claude/claude_desktop_config.json"
+}
+
+@test "backup_user_config: no user config - returns 0 and stays quiet" {
+	# First-ever launch. Dropping the per-source existence test leaves
+	# cp failing on a missing file, which both fails the function (it
+	# is the last command in the loop) and, without the redirect,
+	# prints cp's diagnostic over the launcher's own output.
+	run backup_user_config
+	[[ $status -eq 0 ]]
+	[[ -z $output ]]
+	[[ ! -e "$(_backup_slot claude_desktop_config.json 1)" ]]
+}
+
+@test "backup_user_config: first launch - slot .1 is a byte-identical copy" {
+	local cfg="$XDG_CONFIG_HOME/Claude/claude_desktop_config.json"
+	_write_user_config '{"mcpServers":{"fs":{"command":"npx"}}}'
+
+	setup_logging
+	backup_user_config
+
+	# Recovery is a plain file copy, so the bytes have to round-trip.
+	cmp -s "$cfg" "$(_backup_slot claude_desktop_config.json 1)"
+	grep -q 'Backed up claude_desktop_config.json (keep 5)' "$log_file"
+}
+
+@test "backup_user_config: changed config rotates the previous copy to .2" {
+	_write_user_config '{"mcpServers":{"fs":{"command":"npx"}}}'
+	setup_logging
+	backup_user_config
+
+	# The wipe mode: the live file comes back as an empty object.
+	_write_user_config '{}'
+	backup_user_config
+
+	local name=claude_desktop_config.json
+	[[ $(_backup_body "$name" 1) == '{}' ]]
+	[[ $(_backup_body "$name" 2) == \
+		'{"mcpServers":{"fs":{"command":"npx"}}}' ]]
+}
+
+@test "backup_user_config: unchanged config does not rotate or log" {
+	_write_user_config '{"mcpServers":{}}'
+	setup_logging
+	backup_user_config
+	: > "$log_file"
+
+	backup_user_config
+
+	# Rotating on every launch would walk the last good copy off the
+	# end of the five slots after four idle starts.
+	[[ ! -e "$(_backup_slot claude_desktop_config.json 2)" ]]
+	! grep -q 'Backed up' "$log_file"
+}
+
+@test "backup_user_config: keeps five slots and drops the oldest" {
+	setup_logging
+	local i
+	for i in {1..7}; do
+		_write_user_config "{\"n\":$i}"
+		backup_user_config
+	done
+
+	local name=claude_desktop_config.json
+	[[ $(_backup_body "$name" 1) == '{"n":7}' ]]
+	[[ $(_backup_body "$name" 5) == '{"n":3}' ]]
+	[[ ! -e "$(_backup_slot "$name" 6)" ]]
+}
+
+@test "backup_user_config: nested Cowork stores flatten into one name" {
+	local store="$XDG_CONFIG_HOME/Claude/local-agent-mode-sessions"
+	store="$store/acct-uuid/org-uuid"
+	mkdir -p "$store"
+	echo spaces > "$store/spaces.json"
+	echo remote > "$store/remote-session-spaces.json"
+	echo tasks > "$store/scheduled-tasks.json"
+	echo other > "$store/history.json"
+
+	setup_logging
+	backup_user_config
+
+	local base='local-agent-mode-sessions__acct-uuid__org-uuid'
+	[[ $(_backup_body "${base}__spaces.json" 1) == spaces ]]
+	[[ $(_backup_body "${base}__remote-session-spaces.json" 1) == remote ]]
+	[[ $(_backup_body "${base}__scheduled-tasks.json" 1) == tasks ]]
+
+	# Flattening, not basename: two accounts' spaces.json must not
+	# collide in one slot.
+	[[ ! -e "$(_backup_slot spaces.json 1)" ]]
+	# Only the three known stores are rotated.
+	[[ ! -e "$(_backup_slot "${base}__history.json" 1)" ]]
+}
+
+@test "backup_user_config: falls back to HOME/.cache when XDG unset" {
+	# The function re-derives the cache root rather than reusing
+	# setup_logging's, so the fallback needs its own case.
+	unset XDG_CACHE_HOME
+	_write_user_config '{"mcpServers":{}}'
+
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	backup_user_config
+
+	local slot="$HOME/.cache/claude-desktop-debian/config-backups"
+	slot="$slot/claude_desktop_config.json.1"
+	[[ $(cat "$slot") == '{"mcpServers":{}}' ]]
+}
+
+@test "backup_user_config: unwritable backup dir - returns 0 silently" {
+	local jail="$TEST_TMP/readonly"
+	mkdir -p "$jail"
+	chmod 500 "$jail"
+	# Fail-safe: the rotation must never block launch. Root,
+	# CAP_DAC_OVERRIDE and mode-ignoring mounts all leave the jail
+	# writable, and then there is no failure to be fail-safe about;
+	# one predicate covers all three.
+	[[ -w $jail ]] && skip 'directory mode not enforced here'
+
+	_write_user_config '{"mcpServers":{}}'
+	log_file="$TEST_TMP/launcher.log"
+	: > "$log_file"
+	export XDG_CACHE_HOME="$jail/cache"
+
+	run backup_user_config
+	[[ $status -eq 0 ]]
+	# mkdir's own diagnostic must not reach the launch output either.
+	[[ -z $output ]]
+	! grep -q 'Backed up' "$log_file"
 }
 
 # =============================================================================

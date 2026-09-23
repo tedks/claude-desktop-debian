@@ -4,7 +4,7 @@
 # Every workflow that installs floored tooling sets up a Node that can
 # actually run it.
 #
-# ci.yml, issue-triage.yml and issue-triage-v2.yml all `npm install -g`
+# ci.yml and issue-triage-v2.yml both `npm install -g`
 # tools with a Node engine floor above 20: @electron/asar has declared
 # engines.node >=22.12.0 since 4.0.0 and every 4.x release refuses to
 # start below it, and @anthropic-ai/claude-code declares >=22.0.0.
@@ -53,7 +53,6 @@ readonly NODE_MIN_MAJOR=22
 
 readonly FLOORED_WORKFLOWS=(
 	ci.yml
-	issue-triage.yml
 	issue-triage-v2.yml
 )
 
@@ -69,6 +68,19 @@ node_majors() {
 		[[ "$line" =~ ^[[:space:]]*# ]] && continue
 		[[ "$line" =~ $re ]] || continue
 		printf '%s\n' "${BASH_REMATCH[1]}"
+	done < "${WORKFLOW_DIR}/$1"
+}
+
+# The live `actions/setup-node` steps in workflow <1>, one per line and
+# comment lines skipped so a commented-out step cannot inflate the count.
+# Emitted rather than counted so the caller counts both sides of the
+# comparison below the same way.
+setup_node_steps() {
+	local line
+	while IFS= read -r line; do
+		[[ "$line" =~ ^[[:space:]]*# ]] && continue
+		[[ "$line" == *uses:*actions/setup-node* ]] || continue
+		printf '%s\n' "$line"
 	done < "${WORKFLOW_DIR}/$1"
 }
 
@@ -97,6 +109,34 @@ node_majors() {
 	[[ -z "$violations" ]] || {
 		printf 'below the Node %s floor:\n%s' \
 			"$NODE_MIN_MAJOR" "$violations" >&2
+		false
+	}
+}
+
+@test "every setup-node step declares its own node-version" {
+	# The two tests above leave one hole between them: test 1 asks only
+	# for at least one version per file, and test 2 judges only the
+	# versions that are present. So deleting a single `node-version`
+	# key from a file that has others passes both, and that step
+	# silently takes the runner's default Node instead of ours.
+	#
+	# Today that default clears the floor (22.23.2 on ubuntu-latest),
+	# which is exactly why it would go unnoticed until the day it does
+	# not. Whether the runtime is ours or the runner's is the thing
+	# this suite exists to pin, so the count is asserted rather than
+	# the value.
+	local workflow steps keys mismatches=''
+	for workflow in "${FLOORED_WORKFLOWS[@]}"; do
+		steps=$(setup_node_steps "$workflow" | wc -l)
+		keys=$(node_majors "$workflow" | wc -l)
+		[[ "$steps" -eq "$keys" ]] && continue
+		mismatches+="${workflow}: ${steps} setup-node step(s),"
+		mismatches+=" ${keys} node-version key(s)"$'\n'
+	done
+
+	[[ -z "$mismatches" ]] || {
+		printf 'setup-node steps without a node-version:\n%s' \
+			"$mismatches" >&2
 		false
 	}
 }
