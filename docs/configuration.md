@@ -37,7 +37,7 @@ On Wayland sessions the launcher picks a display backend per compositor:
 
 By default only Niri is auto-selected for native Wayland. GNOME Wayland stays on XWayland by default even though mutter no longer honours XWayland global key grabs ([#404](https://github.com/aaddrick/claude-desktop-debian/issues/404)) — flipping the default GNOME session off XWayland is a rendering/IME/HiDPI risk, so it's left opt-in for now.
 
-To route Quick Entry's global shortcut (`Ctrl+Alt+Space`) through the XDG GlobalShortcuts portal on GNOME, opt into native Wayland with `CLAUDE_USE_WAYLAND=1`. On **GNOME ≤ 49** this works after a one-time portal permission dialog (accept it to bind the shortcut). On **GNOME 50 / xdg-desktop-portal ≥ 1.20 it does not work yet**: the newer portal requires apps to declare identity via `org.freedesktop.host.portal.Registry.Register`, which Electron/Chromium doesn't do, so `globalShortcut.register()` fails and the shortcut stays focus-bound. Tracked upstream at [electron/electron#51875](https://github.com/electron/electron/issues/51875).
+To route Quick Entry's global shortcut (`Ctrl+Alt+Space`) through the XDG GlobalShortcuts portal on GNOME, opt into native Wayland with `CLAUDE_USE_WAYLAND=1`. It works after a one-time portal permission dialog (accept it to bind the shortcut), verified on GNOME 50.1 with xdg-desktop-portal 1.21.1. xdg-desktop-portal ≥ 1.20 requires apps to declare identity via `org.freedesktop.host.portal.Registry.Register` and refuses an id with no installed `<id>.desktop`. Electron ≥ 44 makes the call ([electron/electron#51875](https://github.com/electron/electron/issues/51875)) with the id `com.anthropic.Claude`, so on native Wayland the launcher writes a hidden `~/.local/share/applications/com.anthropic.Claude.desktop` whenever no system copy exists ([#805](https://github.com/aaddrick/claude-desktop-debian/issues/805)).
 
 Override the auto-detection with `CLAUDE_USE_WAYLAND`:
 
@@ -120,6 +120,16 @@ Requirements when flagged:
 | bubblewrap | `bwrap` installed, with unprivileged user namespaces allowed (Ubuntu 24.04+ blocks them via AppArmor — see [troubleshooting.md](troubleshooting.md)) | `_doctor_check_bwrap_fallback` |
 
 Run `claude-desktop-unofficial --doctor` with the flag set to see the bwrap-path diagnostics. Isolation is namespace-level, not a VM — weaker than the KVM default, which is the trade for running where KVM can't. Any `COWORK_VM_BACKEND` value other than `bwrap` is a 2.x knob the official client ignores.
+
+Extra host paths can be exposed to the sandbox via `coworkBwrapMounts` (`additionalBinds` / `additionalROBinds`) in `~/.config/Claude/claude_desktop_linux_config.json`.
+
+> **Note for immutable distros (Fedora Silverblue, Bazzite):** on these
+> systems `/home` is a symlink to `/var/home` on the *host*, but the sandbox
+> has no such symlink — `$HOME` inside the sandbox is the literal
+> `/home/<user>` form. Use the same form in your config
+> (for example `"/home/cloud/dev"`, not `"/var/home/cloud/dev"`) so the
+> mount is accessible under `~/` inside the sandbox. Both forms are accepted
+> by the validator; only the `/home/...` form will appear under `$HOME`.
 
 ## Removed in v3.0.0
 

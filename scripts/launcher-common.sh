@@ -126,10 +126,10 @@ detect_display_backend() {
 	# XWayland global key grabs (#404), and native Wayland would route
 	# Quick Entry's globalShortcut through the XDG GlobalShortcuts portal
 	# instead -- but flipping the default session off mature XWayland is
-	# a rendering / IME / HiDPI risk, and on GNOME 50 the portal path is
-	# a no-op anyway (electron/electron#51875). GNOME users who want the
-	# portal route opt in with CLAUDE_USE_WAYLAND=1 (works on GNOME <=49
-	# after the one-time portal permission dialog).
+	# a rendering / IME / HiDPI risk. GNOME users who want the portal
+	# route opt in with CLAUDE_USE_WAYLAND=1 (works after the one-time
+	# portal permission dialog; GNOME 50 / portal >= 1.20 also needs the
+	# app-id entry ensure_portal_app_id_entry writes, #805).
 	#
 	# Sway and Hyprland keep working XWayland grabs and their wlroots
 	# portal has no GlobalShortcuts backend, so they also stay on the
@@ -452,6 +452,14 @@ _proc_state() {
 }
 
 # Is a live (runnable) Claude Desktop UI running for this user?
+#
+# Two fingerprints, because the answer gates the reapers: a "no" lets
+# them kill helpers. Our own UI carries --class=$WM_CLASS
+# (_claude_desktop_ui_pids). Anthropic's official build, which D-002
+# lets users install side by side, runs its main process without
+# --class, so on the --class check alone our launcher saw "no UI" and
+# reaped the official app's renderers (#903). Any Claude Desktop main
+# process therefore also counts; this only makes the reapers skip more.
 _claude_desktop_ui_is_alive() {
 	local pid state
 	for pid in $(_claude_desktop_ui_pids); do
@@ -459,6 +467,36 @@ _claude_desktop_ui_is_alive() {
 		state=$(_proc_state "$pid") || continue
 		[[ $state == T || $state == t || $state == Z ]] && continue
 		# Found a genuine live Electron UI.
+		return 0
+	done
+	_claude_desktop_any_main_is_alive
+}
+
+# Is any runnable Claude Desktop Electron main process up for this user,
+# whoever launched it (#903)? Every build ships the Electron ELF as
+# `claude-desktop` (official deb, ours, the AppImage mount, Nix), and
+# Chromium's helpers are the same binary with --type=, so: exe basename
+# `claude-desktop` (" (deleted)" stripped, for an upgraded binary) and
+# no --type= and not run as Node (ELECTRON_RUN_AS_NODE=1). A launcher
+# script is excluded by its exe (bash).
+_claude_desktop_any_main_is_alive() {
+	local pid exe cmdline state
+	for pid in $(pgrep -u "$(id -u)" -x claude-desktop 2>/dev/null); do
+		[[ $pid == "$$" || $pid == "$PPID" ]] && continue
+		exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+		exe=${exe% (deleted)}
+		[[ ${exe##*/} == claude-desktop ]] || continue
+		cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline") \
+			|| continue
+		[[ $cmdline == *--type=* ]] && continue
+		# Electron run as Node (a fork or MCP server): same exe, no
+		# --type=, but not a main. Counting it would let an orphan
+		# hold the gate open and shield itself from the reapers.
+		# An unreadable environ falls through to "alive" (safe side).
+		tr '\0' '\n' 2>/dev/null < "/proc/$pid/environ" \
+			| grep -qx 'ELECTRON_RUN_AS_NODE=1' && continue
+		state=$(_proc_state "$pid") || continue
+		[[ $state == T || $state == t || $state == Z ]] && continue
 		return 0
 	done
 	return 1
@@ -631,29 +669,78 @@ _desktop_helper_cmdline_matches() {
 	local cmdline="$1"
 	local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
 
-	case "$cmdline" in
-		*cowork-vm-service.js*)
-			return 0
-			;;
+	# /proc/PID/cmdline is NUL-joined and rendered with tr, so argv[0] is
+	# everything up to the first space. Every arm that identifies a
+	# process by the *binary it is running* tests argv[0], never the whole
+	# string: a bystander that merely names one of our binaries as an
+	# argument -- `gdb .../chrome_crashpad_handler core`, `coredumpctl
+	# gdb`, an editor, a `less` -- must not land in the reaper's kill
+	# list. That scenario is not hypothetical: this reaper's own bug
+	# leaves crashpad cores lying around to be debugged.
+	#
+	# Argv[0] carrying a space degrades to a miss, never a false match.
+	# Our install prefixes and the AppImage mount point have none.
+	local argv0="${cmdline%% *}"
+
+	case "$argv0" in
 		*cowork-linux-helper*)
 			# Official Rust Cowork helper, spawned via
-			# process.resourcesPath (relocation-safe, so no fixed path).
+			# process.resourcesPath (relocation-safe, so no
+			# fixed path).
+			return 0
+			;;
+		*/usr/lib/claude-desktop/*chrome_crashpad_handler*|\
+		*/usr/lib/claude-desktop-unofficial/*chrome_crashpad_handler*)
+			# Crashpad is built to outlive the browser it
+			# monitors, so it is the survivor the --type= arm
+			# below cannot catch: it is spawned with
+			# --monitor-self-annotation=ptype=crashpad-handler
+			# and carries no --type= switch at all.
+			#
+			# Harmless on deb/rpm, fatal on AppImage. The
+			# runtime unmounts /tmp/.mount_claude* as soon as
+			# AppRun exits, and crashpad's own text pages are
+			# mmap'd from that mount, so it faults on its next
+			# instruction and dies SIGBUS (si_code BUS_ADRERR)
+			# once per quit, dumping a core.
+			#
+			# The path prefix keeps this scoped to our tree: a
+			# bystander /usr/lib/chromium/chrome_crashpad_handler
+			# must not match.
+			return 0
+			;;
+	esac
+
+	# Chromium's own helpers: an in-tree argv[0] *and* a --type=
+	# switch. Both halves are load-bearing -- the tree alone would
+	# also match resources/chrome-native-host, which Chrome (not
+	# Claude Desktop) spawns and owns the lifetime of.
+	#
+	# The claude-desktop-unofficial prefix is our package, renamed in
+	# v3.0.0; the claude-desktop one keeps matching Anthropic's own
+	# install and the AppImage internal tree.
+	case "$argv0" in
+		*/usr/lib/claude-desktop/*|\
+		*/usr/lib/claude-desktop-unofficial/*)
+			case "$cmdline" in
+				*--type=*)
+					return 0
+					;;
+			esac
+			;;
+	esac
+
+	# Argument-shaped arms: these identify a helper by what it was
+	# handed, not by which binary runs it (argv[0] here is node, or
+	# the Electron main). They stay whole-cmdline by necessity.
+	case "$cmdline" in
+		*cowork-vm-service.js*)
 			return 0
 			;;
 		*"--user-data-dir=$config_dir "*)
 			return 0
 			;;
 		*"$config_dir/Claude Extensions/"*)
-			return 0
-			;;
-		*/usr/lib/claude-desktop/*--type=*)
-			return 0
-			;;
-		*/usr/lib/claude-desktop-unofficial/*--type=*)
-			# Phase 3 package rename, landing in v3.0.0: our package
-			# installs to /usr/lib/claude-desktop-unofficial while the
-			# official arm above keeps matching Anthropic's install
-			# (and the AppImage internal tree).
 			return 0
 			;;
 	esac
@@ -839,6 +926,19 @@ backup_user_config() {
 	done
 }
 
+# Print $1 as a double-quoted desktop-entry Exec token, mirroring the
+# escaping upstream applies to its own execPath: backslash-escape
+# \ " ` $, then % -> %%.
+_desktop_exec_quote() {
+	local escaped="$1"
+	escaped=${escaped//\\/\\\\}
+	escaped=${escaped//\"/\\\"}
+	escaped=${escaped//\`/\\\`}
+	escaped=${escaped//\$/\\\$}
+	escaped=${escaped//%/%%}
+	printf '"%s"' "$escaped"
+}
+
 # AUTO-1: when "Run on startup" is enabled, the official app writes
 # its own XDG autostart entry with Exec=<process.execPath> --startup —
 # the raw Electron ELF (or, under AppImage, the ephemeral
@@ -859,7 +959,7 @@ heal_autostart_entry() {
 	local launcher="$1"
 	local entry_dir="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 	local entry="$entry_dir/claude-desktop.desktop"
-	local exec_line current args rest escaped new_line tmp line
+	local exec_line current args rest new_line tmp line
 	local replaced=false
 
 	[[ -n $launcher && -f $entry ]] || return 0
@@ -885,15 +985,7 @@ heal_autostart_entry() {
 		*) return 0 ;;
 	esac
 
-	# Desktop-entry escaping, mirroring what upstream applies to its
-	# own execPath: backslash-escape \ " ` $, then % -> %%.
-	escaped="$launcher"
-	escaped=${escaped//\\/\\\\}
-	escaped=${escaped//\"/\\\"}
-	escaped=${escaped//\`/\\\`}
-	escaped=${escaped//\$/\\\$}
-	escaped=${escaped//%/%%}
-	new_line="Exec=\"$escaped\"$args"
+	new_line="Exec=$(_desktop_exec_quote "$launcher")$args"
 
 	# Rewrite only the first Exec line; keep everything else verbatim.
 	tmp="$entry.tmp.$$"
@@ -911,6 +1003,121 @@ heal_autostart_entry() {
 		log_message \
 			"Healed autostart Exec: $current -> $launcher (AUTO-1)"
 	fi
+	return 0
+}
+
+# Marker line identifying the hidden entry written by
+# ensure_portal_app_id_entry, so the launcher only ever rewrites or
+# removes its own file, never a user-authored one.
+readonly PORTAL_ENTRY_MARKER='X-Claude-Desktop-Debian-Portal-Alias=true'
+
+# The official app writes its own copy of <id>.desktop to the user data
+# dir (marked X-Claude-Generated=true, TryExec = the official Exec), but
+# only while the official system entry exists. That copy outlives the
+# official package: once TryExec stops resolving, GLib rejects the
+# entry and the portal refuses the app id again. Such a copy is
+# app-owned and dead, so ensure_portal_app_id_entry may replace it.
+# Returns 0 for a stale copy, 1 otherwise.
+_portal_entry_is_stale_generated() {
+	local entry="$1" try_exec
+	grep -qxF 'X-Claude-Generated=true' "$entry" 2>/dev/null \
+		|| return 1
+	try_exec=$(grep -m1 '^TryExec=' "$entry" 2>/dev/null) || return 1
+	try_exec="${try_exec#TryExec=}"
+	[[ -n $try_exec ]] || return 1
+	if [[ $try_exec == /* ]]; then
+		[[ ! -x $try_exec ]]
+	else
+		! command -v -- "$try_exec" > /dev/null 2>&1
+	fi
+}
+
+# #805: xdg-desktop-portal >= 1.20 identifies a host (non-Flatpak) app
+# by the id it passes to org.freedesktop.host.portal.Registry.Register,
+# and refuses any id without an installed <id>.desktop ("Could not
+# register app ID: App info not found"). GlobalShortcuts CreateSession
+# then fails with "An app id is required", so Quick Entry's hotkey is
+# never bound. Chromium (Electron >= 44) registers the asar desktopName
+# minus ".desktop" -- $WM_CLASS -- but our packages install
+# <package>.desktop: the official package owns
+# /usr/share/applications/$WM_CLASS.desktop and we install side-by-side
+# with it (D-002), so shipping that path would be a file conflict.
+#
+# So on native Wayland, the only backend that talks to the portal,
+# write a hidden (NoDisplay) user-level entry under that id when no
+# system one exists. Once one does (the official package got
+# installed), remove ours so it stops shadowing the official menu
+# entry. An entry without PORTAL_ENTRY_MARKER is left in place (and
+# logged), except the official app's own stale copy -- see
+# _portal_entry_is_stale_generated.
+#
+# $1 = absolute launcher path for Exec (/usr/bin/<package> or
+#      "$APPIMAGE"; empty -> no-op, like heal_autostart_entry)
+# $2 = icon name
+# Requires: is_wayland, use_x11_on_wayland (detect_display_backend)
+ensure_portal_app_id_entry() {
+	local launcher="$1"
+	local icon="${2:-}"
+	local data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+	local entry="$data_home/applications/$WM_CLASS.desktop"
+	local ours=false stale=false dir tmp
+	local -a data_dirs
+
+	# Unsubstituted build-time placeholder: no real id to register.
+	[[ $WM_CLASS == *@@* ]] && return 0
+
+	if [[ -f $entry ]]; then
+		if grep -qxF "$PORTAL_ENTRY_MARKER" "$entry"; then
+			ours=true
+		elif _portal_entry_is_stale_generated "$entry"; then
+			stale=true
+		fi
+	fi
+
+	IFS=: read -r -a data_dirs \
+		<<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+	for dir in "${data_dirs[@]}"; do
+		[[ -n $dir && -f $dir/applications/$WM_CLASS.desktop ]] \
+			|| continue
+		# A system entry already satisfies the portal.
+		if [[ $ours == true ]] && rm -f "$entry"; then
+			log_message "Removed portal app-id entry $entry" \
+				"(system entry $dir/applications/$WM_CLASS.desktop)"
+		fi
+		return 0
+	done
+
+	[[ $is_wayland == true && $use_x11_on_wayland == false ]] \
+		|| return 0
+	[[ -n $launcher ]] || return 0
+	# Any other entry is not ours to replace. Log it: if it is invalid,
+	# the portal keeps refusing the app id and nothing else says why.
+	if [[ -f $entry && $ours == false && $stale == false ]]; then
+		log_message "Left portal app-id entry $entry in place" \
+			'(not written by the launcher)'
+		return 0
+	fi
+
+	mkdir -p "${entry%/*}" 2>/dev/null || return 0
+	tmp="$entry.tmp.$$"
+	{
+		echo '[Desktop Entry]'
+		echo 'Type=Application'
+		echo 'Name=Claude'
+		echo "Exec=$(_desktop_exec_quote "$launcher")"
+		[[ -n $icon ]] && echo "Icon=$icon"
+		echo 'NoDisplay=true'
+		echo "$PORTAL_ENTRY_MARKER"
+	} > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+
+	if [[ $ours == true ]] && cmp -s "$tmp" "$entry"; then
+		rm -f "$tmp"
+		return 0
+	fi
+	mv -f "$tmp" "$entry" 2>/dev/null || { rm -f "$tmp"; return 0; }
+	[[ $stale == true ]] && log_message \
+		'Replacing stale app-generated entry (TryExec not found)'
+	log_message "Wrote portal app-id entry $entry (#805)"
 	return 0
 }
 
