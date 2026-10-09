@@ -8,6 +8,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — 
 
 <!-- Updated automatically by check-claude-version; will be current at release time. -->
 
+## [v3.3.9] — 2026-10-09
+
+### Fixed
+
+- The AppImage runs on hosts without libfuse2, such as Fedora 44 Atomic Desktops (Silverblue, Kinoite) and a default Ubuntu 24.04 install. It embedded AppImageKit's runtime, which loads `libfuse.so.2` to mount itself and failed with `dlopen(): error loading libfuse.so.2`. It now embeds the static AppImage/type2-runtime, built with appimagetool from the AppImage/appimagetool project, both pinned by release and SHA-256. The build no longer needs FUSE either: appimagetool runs with `APPIMAGE_EXTRACT_AND_RUN=1`. ([#932](https://github.com/aaddrick/claude-desktop-debian/issues/932))
+
+## [v3.3.8] — 2026-10-09
+
+### Fixed
+
+- The opt-in bwrap fallback (`COWORK_VM_BACKEND=bwrap`) now applies the mount settings the app sends for each Cowork folder. A read-only folder whose mode carries a suffix (`ro+hide`, `ro+hide+glob`) was bound read-write, and a folder mounted through `mountPath` lost its mode entirely. The app's list of protected subpaths inside a folder (credential stores, keys, browser profiles) is now honored: a protected directory appears empty and read-only, and a protected file can't be read. A folder whose list can't be applied is not mounted, as the app itself does, and a skipped folder no longer becomes the session's working directory.
+- When Cowork runs without a sandbox (the host backend) and the session's `CLAUDE_CONFIG_DIR` is a guest path with no matching mount, the daemon now unsets it so Claude Code falls back to `~/.claude`. Since the April path rework it stored `null`, which reached Claude Code as the literal string `null`, a config directory named `null`.
+
+## [v3.3.7] — 2026-10-09
+
+### Fixed
+
+- Cowork project folders outside `$HOME` work under the opt-in bwrap fallback (`COWORK_VM_BACKEND=bwrap`). The app sends mount paths root-relative, but the daemon read an off-home one as home-relative, created an empty `~/<path>` and bound that, so the session saw an empty folder. Both mount routes (spawn-time `additionalMounts` and runtime `mountPath`) now share one validator: an off-home path must already be a directory and is never created, the bound path is resolved the way the kernel will resolve it (dangling symlinks included), `..` segments and `/`, `/proc`, `/sys`, `/dev` are rejected, and each accepted off-home bind is logged. Nothing is ever created outside `$HOME`. ([#676](https://github.com/aaddrick/claude-desktop-debian/issues/676))
+
 ## [v3.3.6] — 2026-10-07
 
 ### Fixed
