@@ -390,9 +390,12 @@ the Cowork Mode section reports each missing piece with a fix:
   its firmware probe list (`/usr/share/OVMF/OVMF_CODE_4M.fd`,
   `/usr/share/OVMF/OVMF_CODE.fd`; arm64: `/usr/share/AAVMF/AAVMF_CODE.fd`)
   with no env override, so edk2 firmware installed elsewhere is not found.
-  Our RPM package's `%post` creates a compat symlink at the probed path
-  automatically (CW-1); on other layouts, symlink your edk2 firmware to
-  one of the probed paths by hand.
+  It also derives the VARS template by swapping `CODE` for `VARS` in the
+  path it found, so the matching `OVMF_VARS*.fd` must sit beside it.
+  Our RPM package's `%post` links a matching CODE/VARS pair
+  automatically (CW-1); on other layouts, symlink both files by hand
+  (for example `OVMF_CODE.fd` and `OVMF_VARS.fd` in `/usr/share/OVMF/`).
+  `--doctor` warns when the VARS file is missing.
 - **virtiofsd not found** — install it (Debian/Ubuntu:
   `qemu-system-common`; Fedora: `virtiofsd`).
 
@@ -788,16 +791,13 @@ claude-desktop`). A version of `1.17377.1` or higher is **Anthropic's
 official package** — leave it alone unless you mean to uninstall the
 official app too.
 
-### For AUR installations (Arch Linux)
+### For legacy AUR installations (`claude-desktop-appimage`)
+
+This project no longer publishes to the AUR
+([#817](https://github.com/aaddrick/claude-desktop-debian/issues/817)),
+so an installed `claude-desktop-appimage` gets no further updates:
 
 ```bash
-# Using yay
-yay -R claude-desktop-appimage
-
-# Or using paru
-paru -R claude-desktop-appimage
-
-# Or using pacman directly
 sudo pacman -R claude-desktop-appimage
 ```
 
