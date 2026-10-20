@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — 
 
 <!-- Updated automatically by check-claude-version; will be current at release time. -->
 
+### Changed
+
+- The AppImage keeps Chromium's sandbox on. It passed `--no-sandbox` on every launch, citing FUSE, but the `nosuid` mount only rules out the setuid `chrome-sandbox` helper, and Chromium's user-namespace sandbox works from inside the mount. The launcher now passes `--no-sandbox` only when unprivileged user namespaces are unavailable: `user.max_user_namespaces=0`, `kernel.unprivileged_userns_clone=0`, Ubuntu 24.04+'s `apparmor_restrict_unprivileged_userns=1` (no AppArmor profile can cover the AppImage's changing mount path), or creating one with `unshare` fails, as under a container's seccomp profile. `CLAUDE_FORCE_SANDBOX=1` keeps the sandbox on regardless. `--doctor` reports whether the sandbox is on for AppImage runs and why not. ([#884](https://github.com/aaddrick/claude-desktop-debian/issues/884))
+
+## [v3.3.12] — 2026-10-20
+
+### Fixed
+
+- Cowork finds OVMF firmware on Arch, CachyOS, Manjaro and EL (RHEL, CentOS Stream, Alma, Rocky 9/10) hosts in every package format, including the AppImage. The official client only looks in `/usr/share/OVMF/`, while these distros install edk2 under `/usr/share/edk2/x64/` (Arch) or `/usr/share/edk2/ovmf/` (EL). The RPM's `%post` links cover RPM installs, but the AppImage has no install step and can't write `/usr/share`, so it found no firmware. A new asar patch adds both edk2 paths after the official ones, and `--doctor` counts them. ([#947](https://github.com/aaddrick/claude-desktop-debian/pull/947), [#884](https://github.com/aaddrick/claude-desktop-debian/issues/884))
+- `--doctor` no longer passes the EL QEMU check when the launcher's `qemu-system-<arch>` link is missing. It passed whenever `/usr/libexec/qemu-kvm` existed, even if the launcher had never created the link that Cowork actually uses. It now warns when the link is missing or points elsewhere, and says to launch once and re-run. ([#947](https://github.com/aaddrick/claude-desktop-debian/pull/947), [#884](https://github.com/aaddrick/claude-desktop-debian/issues/884))
+
 ## [v3.3.11] — 2026-10-17
 
 ### Fixed

@@ -1216,6 +1216,27 @@ _check_cowork_virtiofsd() {
 	_cowork_incomplete=true
 }
 
+# Colon-list of firmware CODE paths the (patched) client probes, in
+# order, for a `uname -m` value. The x86_64 tail is what
+# scripts/patches/cowork-firmware-probe.sh appends (#884); keep the
+# two in step (tests/doctor.bats checks it).
+#
+# Usage: _cowork_fw_probe_paths <machine>
+_cowork_fw_probe_paths() {
+	case "$1" in
+		aarch64)
+			echo '/usr/share/AAVMF/AAVMF_CODE.fd'
+			;;
+		*)
+			local paths='/usr/share/OVMF/OVMF_CODE_4M.fd'
+			paths+=':/usr/share/OVMF/OVMF_CODE.fd'
+			paths+=':/usr/share/edk2/x64/OVMF_CODE.4m.fd'
+			paths+=':/usr/share/edk2/ovmf/OVMF_CODE.fd'
+			echo "$paths"
+			;;
+	esac
+}
+
 # Check the QEMU/KVM userspace stack Cowork drives: the arch-matched
 # qemu-system binary on PATH, firmware at the paths the official client
 # hardcodes, and virtiofsd at the paths the client probes (see
@@ -1223,10 +1244,11 @@ _check_cowork_virtiofsd() {
 #
 # Firmware: the official probe list is hardcoded with no env override
 # (audit fact — docs/learnings/official-deb-rebase-verification.md).
-# Firmware present at a Fedora/Arch edk2 location does NOT count, so we
-# check only the official paths and explain the mismatch on a miss. The
-# probe list is overridable via _DOCTOR_OVMF_PATHS (colon-list) for
-# tests.
+# On x86_64 the cowork-firmware-probe patch appends the Arch and
+# EL edk2 CODE paths (#884), so those count too, after the
+# official ones and in the patched order. Anywhere else (openSUSE's
+# .bin names) does NOT count, and a miss explains why. The probe list
+# is overridable via _DOCTOR_OVMF_PATHS (colon-list) for tests.
 #
 # Usage: _check_cowork_stack <distro_id> <resources_dir>
 _check_cowork_stack() {
@@ -1234,26 +1256,30 @@ _check_cowork_stack() {
 	local resources_dir="${2:-}"
 	local qemu_bin fw_default
 	case "$(uname -m)" in
-		aarch64)
-			qemu_bin='qemu-system-aarch64'
-			fw_default='/usr/share/AAVMF/AAVMF_CODE.fd'
-			;;
-		*)
-			qemu_bin='qemu-system-x86_64'
-			fw_default='/usr/share/OVMF/OVMF_CODE_4M.fd'
-			fw_default+=':/usr/share/OVMF/OVMF_CODE.fd'
-			;;
+		aarch64) qemu_bin='qemu-system-aarch64' ;;
+		*) qemu_bin='qemu-system-x86_64' ;;
 	esac
+	fw_default=$(_cowork_fw_probe_paths "$(uname -m)")
 
 	# QEMU binary — the client spawns it by PATH name. On EL 9/10 the
 	# only qemu is /usr/libexec/qemu-kvm, which the launcher exposes
-	# under $qemu_bin (setup_cowork_qemu_path, #884). Path overridable
-	# via _DOCTOR_QEMU_KVM for tests.
+	# under $qemu_bin (setup_cowork_qemu_path, #884). --doctor runs
+	# without the launcher's PATH, so pass only when the shim link the
+	# launcher made is in place and points at qemu-kvm. Path
+	# overridable via _DOCTOR_QEMU_KVM for tests.
 	local qemu_kvm="${_DOCTOR_QEMU_KVM:-/usr/libexec/qemu-kvm}"
+	local qemu_shim
+	qemu_shim="${XDG_CACHE_HOME:-$HOME/.cache}/claude-desktop-debian/bin/$qemu_bin"
 	if command -v "$qemu_bin" &>/dev/null; then
 		_pass "QEMU: $qemu_bin found"
-	elif [[ -x $qemu_kvm ]]; then
+	elif [[ -x $qemu_kvm && -L $qemu_shim \
+		&& $(readlink "$qemu_shim") == "$qemu_kvm" ]]; then
 		_pass "QEMU: $qemu_kvm (the launcher exposes it as $qemu_bin)"
+	elif [[ -x $qemu_kvm ]]; then
+		_warn "QEMU: $qemu_kvm found, but $qemu_shim is missing or does not point at it"
+		_info 'Fix: launch Claude Desktop once (the launcher creates the link), then re-run --doctor'
+		_info "If it stays missing, check that ${qemu_shim%/*} is writable"
+		_cowork_incomplete=true
 	else
 		_warn "QEMU: $qemu_bin not found on PATH"
 		_info "Fix: $(_cowork_pkg_hint "$distro" qemu)"
@@ -1285,12 +1311,12 @@ _check_cowork_stack() {
 			_cowork_incomplete=true
 		fi
 	else
-		_warn 'Firmware: none of the official probe paths exist' \
+		_warn 'Firmware: none of the client-probed paths exist' \
 			"($fw_paths)"
-		_info 'The official client hardcodes this probe list with no' \
-			'env override, so firmware installed elsewhere'
-		_info '(Fedora/Arch edk2 layouts) is not found — add a compat' \
-			'symlink at the probed path.'
+		_info 'The client hardcodes this probe list with no env' \
+			'override, so firmware installed elsewhere'
+		_info '(e.g. openSUSE ovmf-x86_64-*.bin) is not found — add a' \
+			'compat symlink at a probed path.'
 		_cowork_incomplete=true
 	fi
 
@@ -1465,8 +1491,9 @@ _doctor_check_userns_apparmor() {
 	[[ -r $_userns_path ]] && _userns_val=$(<"$_userns_path")
 	# Gate on the deb's installed Electron, not $electron_path (the
 	# invoking build's binary): the profile pins this exact path, so only
-	# a deb install is confined by it. AppImage always runs --no-sandbox
-	# and Nix binaries live in the store — neither can hit the crash.
+	# a deb install is confined by it. AppImage falls back to
+	# --no-sandbox while the restriction is on (#884), and Nix binaries
+	# live in the store — neither can hit the crash.
 	local _deb_electron="${_DOCTOR_DEB_ELECTRON:-}"
 	[[ -n $_deb_electron ]] \
 		|| _deb_electron='/usr/lib/claude-desktop-unofficial/claude-desktop'
@@ -1574,10 +1601,10 @@ _doctor_check_electron_binary() {
 # the AppImage's permission normalization drops the setuid bit, and the
 # mount/extract dir is owned by the running user, so the perms check
 # always failed with a `sudo chown root:root /tmp/.mount_.../` hint that
-# is both unactionable (transient, read-only) and moot —
-# build_electron_args passes --no-sandbox unconditionally for appimage,
-# so the helper is never invoked. Report that once and stop, matching
-# _doctor_check_effective_sandbox's appimage short-circuit.
+# is both unactionable (transient, read-only) and moot — the nosuid
+# FUSE mount means the helper can never run, so Chromium either uses
+# the user-namespace sandbox or gets --no-sandbox (#884). Report that
+# once and stop; _doctor_check_effective_sandbox reports which.
 #
 # _DOCTOR_DEB_SANDBOX overrides the hardcoded deb path (test hook; the
 # default is the real install location, so production is unaffected).
@@ -1588,8 +1615,8 @@ _doctor_check_chrome_sandbox() {
 	local package_type="${2:-}"
 	local sandbox_path
 	if [[ $package_type == 'appimage' ]]; then
-		_info 'Chrome sandbox: not used' \
-			'(AppImage runs with --no-sandbox)'
+		_info 'Chrome sandbox: setuid helper not used' \
+			'(AppImage mounts nosuid)'
 		return 0
 	fi
 	if [[ -n $electron_path ]]; then
@@ -1624,7 +1651,8 @@ _doctor_check_chrome_sandbox() {
 # Wayland, deb/nix launches pass --no-sandbox unconditionally (unless
 # CLAUDE_FORCE_SANDBOX=1), so _doctor_check_chrome_sandbox above can PASS
 # on file permissions while the sandbox is disabled the moment Electron
-# actually launches -- this check reports on that gap directly, by
+# actually launches. #884: the AppImage passes --no-sandbox only when
+# user namespaces are unavailable. This check reports on both directly, by
 # building the real argv the launcher would use rather than
 # re-deriving the same rule a second time (see the "single source of
 # truth" note on build_electron_args -- this project has been burned by
@@ -1650,7 +1678,6 @@ _doctor_check_effective_sandbox() {
 	# deb/nix-only --no-sandbox branch and wrongly report the sandbox
 	# as enabled.
 	[[ $package_type == 'rpm' ]] && package_type='deb'
-	[[ $package_type == 'appimage' ]] && return 0 # already unconditional, covered above
 	declare -F build_electron_args > /dev/null || return 0
 
 	local electron_args
@@ -1661,7 +1688,16 @@ _doctor_check_effective_sandbox() {
 		[[ $arg == '--no-sandbox' ]] && has_no_sandbox=true
 	done
 
-	if [[ $has_no_sandbox == true ]]; then
+	if [[ $has_no_sandbox == true && $package_type == 'appimage' ]]; then
+		local reason
+		reason=$(_userns_sandbox_block_reason)
+		_warn 'Chrome sandbox: disabled at runtime' \
+			"(AppImage: ${reason:-user namespaces unavailable})"
+		_info 'The AppImage cannot use the setuid chrome-sandbox helper, and'
+		_info 'Chromium needs unprivileged user namespaces to sandbox without'
+		_info 'it -- see #884. On Ubuntu 24.04+, the .deb installs an AppArmor'
+		_info 'profile that allows them for its own binary only.'
+	elif [[ $has_no_sandbox == true ]]; then
 		_warn 'Chrome sandbox: disabled at runtime (--no-sandbox on Wayland)'
 		_info 'Regardless of the file-permission result above, the sandbox is'
 		_info 'not actually engaged for this session -- see #804.'
