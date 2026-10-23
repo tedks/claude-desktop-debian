@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 #===============================================================================
 # Official Claude Desktop .deb acquisition: resolve, download, verify,
 # extract. Replaced the Windows-installer download path in the v3.0.0
@@ -22,11 +23,11 @@ OFFICIAL_APT_BASE='https://downloads.claude.ai/claude-desktop/apt/stable'
 
 # Pinned artifact per architecture, seeded from the Packages indexes on
 # 2026-07-04. Bumped by check-claude-version after the rebase lands.
-OFFICIAL_DEB_VERSION='3.1623.1'
-OFFICIAL_DEB_POOL_AMD64='pool/main/c/claude-desktop/claude-desktop_3.1623.1_amd64.deb'
-OFFICIAL_DEB_SHA256_AMD64='731677d2f39b2a7343ee381ec5d3396dd28ec1d832cfcb1f9e4a022e9e80eadb'
-OFFICIAL_DEB_POOL_ARM64='pool/main/c/claude-desktop/claude-desktop_3.1623.1_arm64.deb'
-OFFICIAL_DEB_SHA256_ARM64='8231db266ce586f452e7c310f6e571814d58cd3a3c89c88f02646512411ce2c1'
+OFFICIAL_DEB_VERSION='3.6556.1'
+OFFICIAL_DEB_POOL_AMD64='pool/main/c/claude-desktop/claude-desktop_3.6556.1_amd64.deb'
+OFFICIAL_DEB_SHA256_AMD64='ced5179997fdb90219e866685c7f3bcfcb494514d82022e27c89b28a371dfe87'
+OFFICIAL_DEB_POOL_ARM64='pool/main/c/claude-desktop/claude-desktop_3.6556.1_arm64.deb'
+OFFICIAL_DEB_SHA256_ARM64='488aff13fa0488c70cae41280f2d84827e1dc092e3082fb987554da2de06dcda'
 
 # Set official_deb_url/sha256/filename from the pinned block for the
 # current (or given) architecture.
@@ -127,6 +128,9 @@ resolve_official_deb() {
 		return 1
 	fi
 
+	# sha256 is read by check-claude-version.yml; size is part of the
+	# documented output above.
+	# shellcheck disable=SC2034
 	IFS=$'\t' read -r resolved_official_version resolved_official_filename \
 		resolved_official_sha256 resolved_official_size <<< "$newest"
 
@@ -182,8 +186,8 @@ _control_field() {
 fetch_official_deb() {
 	section_header 'Download the official Claude Desktop .deb'
 
-	official_deb_pin || exit 1
-	local claude_deb_path="$work_dir/$official_deb_filename"
+	official_deb_pin "$architecture" || exit 1
+	local claude_deb_path="${work_dir:?}/$official_deb_filename"
 
 	if [[ -n ${local_deb_path:-} ]]; then
 		echo "Using local official .deb: $local_deb_path"
@@ -236,7 +240,9 @@ fetch_official_deb() {
 	# The dependency contract differs per arch (e.g. qemu-system-x86 vs
 	# qemu-system-arm); packaging re-emits it verbatim rather than
 	# hardcoding a copy.
+	# shellcheck disable=SC2034  # build.sh exports it for packaging
 	official_deb_depends=$(_control_field "$control_path" Depends)
+	# shellcheck disable=SC2034  # build.sh exports it for packaging
 	official_deb_recommends=$(_control_field "$control_path" Recommends)
 
 	if [[ ! -d "$claude_extract_dir/usr/lib/claude-desktop" ]]; then

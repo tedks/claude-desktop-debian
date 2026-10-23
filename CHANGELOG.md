@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — 
 
 <!-- Updated automatically by check-claude-version; will be current at release time. -->
 
+## [v3.3.13] — 2026-10-23
+
+The AppImage sandbox change (#884) first went out in the `v3.3.12+claude3.1623.0` auto-release, and the GPU-crash recovery fix (#946) in `v3.3.12+claude3.1623.1`. This release records them under their own version.
+
 ### Changed
 
 - The AppImage keeps Chromium's sandbox on. It passed `--no-sandbox` on every launch, citing FUSE, but the `nosuid` mount only rules out the setuid `chrome-sandbox` helper, and Chromium's user-namespace sandbox works from inside the mount. The launcher now passes `--no-sandbox` only when unprivileged user namespaces are unavailable: `user.max_user_namespaces=0`, `kernel.unprivileged_userns_clone=0`, Ubuntu 24.04+'s `apparmor_restrict_unprivileged_userns=1` (no AppArmor profile can cover the AppImage's changing mount path), or creating one with `unshare` fails, as under a container's seccomp profile. `CLAUDE_FORCE_SANDBOX=1` keeps the sandbox on regardless. `--doctor` reports whether the sandbox is on for AppImage runs and why not. ([#884](https://github.com/aaddrick/claude-desktop-debian/issues/884))
@@ -15,6 +19,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) — 
 ### Fixed
 
 - GPU-crash recovery survives the `launcher.log` rotation. The launcher rotates the log to `launcher.log.1` once it passes 5 MiB, before the session header is written, so on that launch the previous session's crash signature or "Previous launch hit GPU process FATAL" marker had moved to `.1` and `--disable-gpu` was skipped. A crash-looping session that wrote more than 5 MiB per launch never recovered. The check now also reads `launcher.log.1`, only when the live log holds fewer than two sessions, so the rotated file is scanned on the rotating launch only. ([#946](https://github.com/aaddrick/claude-desktop-debian/issues/946))
+- The launcher no longer takes over the official app's "Run on startup" entry when Anthropic's package is installed next to ours. Both apps write the same `~/.config/autostart/claude-desktop.desktop`, and the launcher rewrote its `Exec` to itself whenever the command ended in `/claude-desktop`, which includes the official `/usr/lib/claude-desktop/claude-desktop`. It now rewrites only our own `/usr/lib/claude-desktop-unofficial/` ELF or a command that no longer exists, such as an unmounted AppImage path. ([#949](https://github.com/aaddrick/claude-desktop-debian/issues/949))
+- The shellcheck workflow now checks every tracked `*.sh`. It only named files with a shebang or a `# shellcheck` line, so nine sourced build scripts were never checked, including the whole patch stage (`app-asar.sh`) and the official `.deb` download and verification (`official-deb.sh`). `-x` follows `build.sh`'s `source` lines, but ShellCheck reports nothing inside a followed file. The nine now start with `# shellcheck shell=bash`, like the sourced scripts that were already covered, and a new sourced script without a shebang or that line fails the workflow with SC2148 instead of being skipped. ([#953](https://github.com/aaddrick/claude-desktop-debian/pull/953))
 
 ## [v3.3.12] — 2026-10-20
 
