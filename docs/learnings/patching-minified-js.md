@@ -329,6 +329,17 @@ says what "fixed upstream" means for that patch:
 - **`never`** — our own feature (the bwrap backend). A no-op is
   breakage; fix the anchor.
 
+To read the verdict without a build, run `tools/patch-necessity-audit.sh`.
+Its `patch_*` rows run every entry in `active_patches` on a throwaway
+copy of the bundle and map the result through the same `patch_retirement`
+kinds, so a new patch gets a row the day it is wired in. Hand-copied
+anchors in the audit drift: by 4.4212.0 its quick-window row read a
+sibling pop-up window and reported `check`. A `bytes` no-op reads
+`not-needed` only when upstream's fix is visibly in the bytes where a
+no-op is ambiguous (org-plugins' `sed` can miss silently; the tray flag
+splices in even after upstream teaches its detector about Cinnamon);
+otherwise it reads `check`.
+
 The harness's second pass (`tests/test-patch-stage.sh`) runs with
 `PATCH_STAGE_RERUN=1`, which inverts the check: over an already-patched
 bundle every patch must change *nothing*, so a guard that misses its
@@ -443,6 +454,9 @@ Two rules fall out, both now in `app-asar.sh` / the patch suite:
   separate warm chunk — resolved there by a stable `[warm]` log literal,
   exactly the "anchor on a developer string, then find the file that
   carries it" move. Don't assume the whole patch touches one file.
+  (C2 is gone now: its anchor left in 1.26832.0, and by 4.4212.0 the
+  client no longer downloads warm files at all, so it was deleted
+  instead of warning on every build.)
 
 **The single-chunk assumption died in 1.26832.0.** That release
 dissolved the core: `index.js` went from a 773-byte stub with one
