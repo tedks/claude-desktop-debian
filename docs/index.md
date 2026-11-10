@@ -45,6 +45,7 @@ Hard-won knowledge from debugging real bugs. Consult before working on the relat
 
 - [**Testing overview**](testing/README.md) — what we test and how it's organized
 - [**Test runbook**](testing/runbook.md) — running tests locally
+- [**Portable terminal patch test**](testing/bazel.md) — Nix-wrapped Bazel gate for synthetic DA1 fixtures
 - [**Test matrix**](testing/matrix.md) — what runs on what distro / format
 - [**Test automation**](testing/automation.md) — CI workflow shape
 - [**Quick-entry closeout**](testing/quick-entry-closeout.md) — the Quick Entry test runner
