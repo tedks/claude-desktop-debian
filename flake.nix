@@ -27,6 +27,10 @@
           inherit claude-desktop claude-desktop-fhs;
           default = claude-desktop-fhs;
         };
+
+        devShells.default = pkgs.mkShell {
+          packages = [ pkgs.bazel_7 pkgs.bats pkgs.nodejs_22 ];
+        };
       };
 
       flake = {

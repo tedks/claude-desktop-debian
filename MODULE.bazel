@@ -1,0 +1,3 @@
+module(name = "claude_desktop_debian", version = "0.0.0")
+
+bazel_dep(name = "rules_shell", version = "0.2.0")

@@ -39,6 +39,7 @@ build-reference/
 # Nix build output
 result
 result-*
+/bazel-*
 
 # Wrangler (Cloudflare Worker dev/deploy cache)
 worker/.wrangler/
