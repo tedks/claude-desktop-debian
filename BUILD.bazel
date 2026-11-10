@@ -1,0 +1,13 @@
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+sh_test(
+    name = "terminal_da_reply_test",
+    srcs = ["tools/bazel-terminal-da-test.sh"],
+    data = [
+        "scripts/patches/app-asar.sh",
+        "scripts/patches/terminal-da-reply.sh",
+        "tests/terminal-da-reply.bats",
+    ],
+    size = "small",
+    visibility = ["//visibility:public"],
+)

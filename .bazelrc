@@ -1,0 +1,5 @@
+common --enable_bzlmod
+common --lockfile_mode=error
+test --spawn_strategy=linux-sandbox
+test --sandbox_default_allow_network=false
+test --test_env=PATH
