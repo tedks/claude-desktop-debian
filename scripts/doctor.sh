@@ -610,6 +610,46 @@ _doctor_check_tray_icon() {
 	fi
 }
 
+# Desktop entry. deb/rpm install /usr/share/applications/<package>.desktop.
+# The community Homebrew tap (#972) links the AppImage's entry, under its
+# component id, into <prefix>/share/applications instead; the keg is
+# recognised from the electron path, which AppRun resolves into
+# <prefix>/Cellar/claude-desktop-unofficial/<version>/. That entry only
+# reaches app menus when <prefix>/share is in XDG_DATA_DIRS, which
+# `brew shellenv` does not set, so say so.
+# $1 = electron path, as passed to run_doctor
+# _DOCTOR_DESKTOP_FILE overrides the deb/rpm path (tests).
+_doctor_check_desktop_entry() {
+	local electron_path=${1:-}
+	local desktop_file=${_DOCTOR_DESKTOP_FILE:-/usr/share/applications/claude-desktop-unofficial.desktop}
+	local keg_marker='/Cellar/claude-desktop-unofficial/'
+	if [[ -f $desktop_file ]]; then
+		_pass "Desktop entry: $desktop_file"
+		return 0
+	fi
+	if [[ $electron_path != *"$keg_marker"* ]]; then
+		_warn 'Desktop entry not found (expected for AppImage installs)'
+		return 0
+	fi
+
+	local share="${electron_path%%"$keg_marker"*}/share"
+	desktop_file="$share/applications/io.github.aaddrick.claude-desktop-debian.desktop"
+	if [[ ! -f $desktop_file ]]; then
+		_warn "Desktop entry not found in $share/applications (Homebrew install)"
+		_info 'Fix: brew reinstall claude-desktop-unofficial'
+		return 0
+	fi
+	_pass "Desktop entry: $desktop_file (Homebrew)"
+	# The XDG Base Directory default applies when the variable is unset.
+	local dirs=":${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:"
+	if [[ $dirs != *":$share:"* && $dirs != *":$share/:"* ]]; then
+		_warn "Desktop entry: $share is not in XDG_DATA_DIRS, so app menus" \
+			"won't list Claude"
+		_info "Fix: add XDG_DATA_DIRS=\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:$share"
+		_info '     to ~/.config/environment.d/homebrew.conf, then log out and back in'
+	fi
+}
+
 # FM-1: the official app's "Send to Claude" / "Open in Claude Code"
 # file-manager entries. PASS only when every entry's command exists and
 # is not an AppImage mount (gone once that app quits), and when a menu
@@ -1347,6 +1387,7 @@ _cowork_fw_probe_paths() {
 			paths+=':/usr/share/OVMF/OVMF_CODE.fd'
 			paths+=':/usr/share/edk2/x64/OVMF_CODE.4m.fd'
 			paths+=':/usr/share/edk2/ovmf/OVMF_CODE.fd'
+			paths+=':/usr/share/qemu/ovmf-x86_64-4m-code.bin'
 			echo "$paths"
 			;;
 	esac
@@ -1360,9 +1401,10 @@ _cowork_fw_probe_paths() {
 # Firmware: the official probe list is hardcoded with no env override
 # (audit fact — docs/learnings/official-deb-rebase-verification.md).
 # On x86_64 the cowork-firmware-probe patch appends the Arch and
-# EL edk2 CODE paths (#884), so those count too, after the
-# official ones and in the patched order. Anywhere else (openSUSE's
-# .bin names) does NOT count, and a miss explains why. The probe list
+# EL edk2 CODE paths and openSUSE's 4M .bin (#884), so those count
+# too, after the official ones and in the patched order. Anywhere
+# else (e.g. openSUSE's 2M ovmf-x86_64-code.bin) does NOT count, and
+# a miss explains why. The probe list
 # is overridable via _DOCTOR_OVMF_PATHS (colon-list) for tests.
 #
 # Usage: _check_cowork_stack <distro_id> <resources_dir>
@@ -1416,9 +1458,11 @@ _check_cowork_stack() {
 		_pass "Firmware: $fw_found"
 		# The client derives the VARS template from the CODE path it
 		# found; a CODE file with no matching VARS file (e.g. a
-		# pre-#884 RPM compat link on EL) breaks the pair.
+		# pre-#884 RPM compat link on EL) breaks the pair. The last
+		# swap is the one cowork-firmware-probe adds for openSUSE.
 		local fw_vars="${fw_found/OVMF_CODE/OVMF_VARS}"
 		fw_vars="${fw_vars/AAVMF_CODE/AAVMF_VARS}"
+		fw_vars="${fw_vars/-code.bin/-vars.bin}"
 		if [[ ! -f $fw_vars ]]; then
 			_warn "Firmware: VARS template missing ($fw_vars)"
 			_info 'The client derives it from the CODE path above.' \
@@ -1430,8 +1474,8 @@ _check_cowork_stack() {
 			"($fw_paths)"
 		_info 'The client hardcodes this probe list with no env' \
 			'override, so firmware installed elsewhere'
-		_info '(e.g. openSUSE ovmf-x86_64-*.bin) is not found — add a' \
-			'compat symlink at a probed path.'
+		_info "(e.g. openSUSE's 2M ovmf-x86_64-code.bin) is not found —" \
+			'add a compat symlink at a probed path.'
 		_cowork_incomplete=true
 	fi
 
@@ -2065,13 +2109,7 @@ print(len(servers))
 	fi
 
 	# -- Desktop integration --
-	local desktop_file
-	desktop_file='/usr/share/applications/claude-desktop-unofficial.desktop'
-	if [[ -f $desktop_file ]]; then
-		_pass "Desktop entry: $desktop_file"
-	else
-		_warn 'Desktop entry not found (expected for AppImage installs)'
-	fi
+	_doctor_check_desktop_entry "$electron_path"
 	_doctor_check_file_manager_entries
 
 	# -- Disk space --
